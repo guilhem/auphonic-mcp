@@ -27,8 +27,30 @@ Le Worker crée un seul brouillon Auphonic et envoie les enregistrements en mult
 ### Parcours des outils
 
 1. `list_presets` puis `get_preset` pour connaître les pistes, les traitements, les sorties et les destinations. `list_services` et `list_service_files` permettent d’explorer les sources externes.
-2. `create_production` pour préparer un brouillon et ses pistes. `upload_production_file` ajoute ou remplace le fichier d’une piste sur le même UUID. `update_production` modifie les métadonnées et le nom de base des sorties.
-3. `check_status` rend compte des fichiers associés, des avertissements et de la possibilité de démarrer. En cas d’erreur partielle, la réponse inclut l’UUID et les pistes manquantes lorsque leur état peut être relu.
+2. `create_production` pour préparer un brouillon et ses pistes. `upload_production_file` ajoute ou remplace le fichier d’une piste sur le même UUID. `update_production` modifie les métadonnées et les réglages du brouillon.
+3. `check_status` affiche les réglages effectifs du brouillon et indique s’il est prêt à démarrer. En cas d’erreur partielle d’upload, la réponse inclut l’UUID et les pistes manquantes lorsque leur état peut être relu.
 4. `start_production` lance le traitement. `list_outputs` indique les fichiers disponibles et `download_output` permet de sélectionner un nom exact. Le lien télécharge le fichier depuis le site privé après connexion.
 
 Les résultats MCP contiennent un objet `structuredContent` en plus du texte. Les listes y sont sous `items`. Les erreurs exposent un code et, selon le cas, l’UUID de production et l’action suivante.
+
+### Régler un brouillon avant traitement
+
+`check_status` affiche les algorithmes du master et des pistes, les débits et formats de sortie, le moteur et la langue de transcription, les destinations et les champs `review_before_publishing` et `in_review` tels que les renvoie Auphonic.
+
+`update_production` prend l’UUID du brouillon et applique les réglages fournis, puis relit la production. Le traitement et la publication se lancent séparément. Les algorithmes du master s’envoient dans `algorithms`, et ceux d’une piste dans `multi_input_files` avec son `id` exact. Le décalage existant est conservé si `offset` et `keep_offset` sont omis.
+
+Exemple d’arguments, avec les UUID et le nom de piste renvoyés par `check_status` :
+
+```json
+{
+  "production_uuid": "<uuid-du-brouillon>",
+  "algorithms": { "leveler": true, "sync_tracks": true, "silence_cutter": false },
+  "multi_input_files": [{ "id": "Hôte", "algorithms": { "denoise": true } }],
+  "remove_outgoing_services": ["<uuid-internet-archive>"],
+  "review_before_publishing": true
+}
+```
+
+`output_files` et `outgoing_services` définissent la liste finale lorsqu’ils sont fournis. Une liste vide retire ses éléments et un champ omis évite de remplacer la liste. Auphonic peut ajouter des formats lors de l’activation de la transcription. Envoyez `speech_recognition: { "language": "fr" }` pour Whisper, ajoutez `uuid` pour un moteur externe, ou envoyez `null` pour désactiver la transcription. `in_review` est un état géré par Auphonic, distinct du réglage `review_before_publishing`.
+
+Certaines modifications prennent plusieurs appels à Auphonic. En cas d’échec, l’outil indique les étapes terminées et le dernier état qu’il a pu relire. Vérifiez cet état avant de recommencer.

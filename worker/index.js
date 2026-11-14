@@ -1,4 +1,4 @@
-const serverInfo = { name: "auphonic-mcp", version: "1.3.0" };
+const serverInfo = { name: "auphonic-mcp", version: "1.4.0" };
 const version = "2026-07-28";
 const capabilities = { tools: {}, resources: {}, prompts: {} };
 const text = (description) => ({ type: "string", description });
@@ -94,17 +94,31 @@ function fileLabel(value) {
 }
 
 function outputDetails(files) {
-  return (files ?? []).map(({ filename, format, ending, size, outgoing_services }) =>
-    ({ filename, format, ending, size_bytes: size, outgoing_services }));
+  return (files ?? []).map(({ size, ...file }) => ({ ...pickFields(file, outputFields), size_bytes: size }));
 }
 
 function destinations(data) {
-  return (data?.outgoing_services ?? []).map(({ uuid, display_name, type, transfer_success }) =>
-    ({ uuid, name: display_name, type, transfer_success }));
+  return (data?.outgoing_services ?? []).map((service) => ({
+    uuid: service.uuid, name: service.display_name, type: service.type, transfer_success: service.transfer_success,
+    settings: serviceSettings(service),
+  }));
 }
 
-function trackDetails({ id, type, input_file, service, algorithms, offset }) {
-  return { id, type, file: fileLabel(input_file), has_input: Boolean(input_file), service, algorithms, offset_seconds: offset };
+function trackDetails({ id, type, input_file, service, algorithms, offset, keep_offset }) {
+  return { id, type, file: fileLabel(input_file), has_input: Boolean(input_file), service, algorithms, offset_seconds: offset, keep_offset };
+}
+
+function processingDetails(data) {
+  const speech = data?.speech_recognition;
+  return {
+    algorithms: data?.algorithms,
+    output_basename: data?.output_basename,
+    speech_recognition: speech && Object.keys(speech).length ? { ...pickFields(speech, speechFields), type: speech.type } : null,
+    review_before_publishing: data?.review_before_publishing,
+    in_review: data?.in_review,
+    outputs: outputDetails(data?.output_files),
+    destinations: destinations(data),
+  };
 }
 
 function productionDetails(data, fallback, env = {}) {
@@ -117,15 +131,14 @@ function productionDetails(data, fallback, env = {}) {
     error: data?.error_message ? { status: data.error_status, message: publicMessage(data.error_message, env) } : undefined,
     warnings: data?.warning_message ? [{ status: data.warning_status, message: publicMessage(data.warning_message, env) }] : [],
     input_file: fileLabel(data?.input_file), tracks: (data?.multi_input_files ?? []).map(trackDetails),
-    outputs: outputDetails(data?.output_files), destinations: destinations(data),
+    ...processingDetails(data),
   };
 }
 
 function presetDetails(data, id) {
   return {
     uuid: data?.uuid ?? id, preset_name: data?.preset_name, is_multitrack: data?.is_multitrack,
-    tracks: (data?.multi_input_files ?? []).map(trackDetails), algorithms: data?.algorithms,
-    outputs: outputDetails(data?.output_files), destinations: destinations(data),
+    tracks: (data?.multi_input_files ?? []).map(trackDetails), ...processingDetails(data),
   };
 }
 
@@ -177,7 +190,7 @@ tool("list_productions", "Liste les productions Auphonic avec pagination et filt
   query: { limit: args.limit ?? 20, offset: args.offset, status: args.status, minimal_data: 1 },
 })).map((item) => productionDetails(item, undefined, env)));
 
-tool("check_status", "Consulte le statut, les pistes et les sorties d’une production.", {
+tool("check_status", "Consulte le statut et les réglages effectifs d’une production, dont les algorithmes du master et des pistes, les débits de sortie, la transcription et la validation avant publication.", {
   production_uuid: productionId,
 }, ["production_uuid"], readOnly, async ({ production_uuid }, env) =>
   productionDetails(await api(env, productionPath(production_uuid) + ".json"), production_uuid, env));
@@ -395,18 +408,240 @@ tool("create_production", "Crée un brouillon vide. Fournissez preset ou show. A
   } }), undefined, env);
 });
 
-tool("update_production", "Modifie le titre, le sous-titre, le résumé ou le nom de base des sorties d’une production existante. Fournissez au moins un champ à modifier.", {
+const bool = (description) => ({ type: "boolean", description });
+const number = (description) => ({ type: "number", description });
+const strings = (description) => ({ type: "array", items: { type: "string" }, description });
+const object = (properties, description, required = []) => ({ type: "object", properties, additionalProperties: false, required, description });
+const trackAlgorithmFields = {
+  filtering: bool("Activer le filtrage"), filtermethod: text("Méthode de filtrage ou d’amélioration"),
+  denoise: bool("Activer le débruitage"), denoisemethod: text("Méthode de débruitage"),
+  denoiseamount: number("Réduction du bruit en dB"), dehum: number("Fréquence du ronflement en Hz"),
+  levelerstrength: number("Intensité du nivellement en pourcentage"), gain: number("Gain de la piste en dB"),
+  pan: text("Panoramique stéréo"), backforeground: text("Rôle de la piste dans le mixage"),
+};
+const masterAlgorithmFields = {
+  leveler: bool("Activer le nivellement"), loudnesstarget: number("Cible de sonie en LUFS"),
+  maxpeak: number("Limite de crête en dBTP"), gate: bool("Activer le noise gate multipiste"),
+  crossgate: bool("Réduire les reprises de voix entre micros"), sync_tracks: bool("Synchroniser les pistes"),
+  silence_cutter: bool("Couper les silences"), filler_cutter: bool("Couper les hésitations"),
+  cough_cutter: bool("Couper les toux"), music_cutter: bool("Couper la musique"),
+  cut_mode: text("Mode d’application des coupes"),
+};
+const algorithmSettings = (properties, description) => ({ type: "object", properties, minProperties: 1, additionalProperties: true, description });
+const outputFields = {
+  format: text("Format Auphonic, par exemple mp3, flac, tracks, transcript ou subtitle"),
+  bitrate: integer("Débit en kbit/s", 0), ending: text("Extension"), filename: text("Nom de fichier complet"),
+  suffix: text("Suffixe du nom de fichier"), mono_mixdown: bool("Mixage mono"),
+  split_on_chapters: bool("Découpage par chapitre"), outgoing_services: strings("UUID des destinations de cette sortie"),
+  burn_in_subtitles: { type: "object", additionalProperties: true, description: "Style complet des sous-titres incrustés dans une sortie vidéo" },
+};
+const speechFields = {
+  uuid: text("UUID du service de transcription externe. Omettez uuid pour sélectionner Auphonic Whisper."),
+  language: text("Langue de transcription, par exemple fr ou auto pour Whisper, fr-FR pour un moteur externe"),
+  keywords: strings("Mots-clés de transcription"), shownotes: bool("Générer les notes et chapitres automatiques"),
+  shownotes_summary_example: text("Exemple de résumé pour les notes"),
+  speaker_diarization_num_speakers: { ...integer("Nombre de locuteurs pour Whisper", 1), type: ["integer", "null"] },
+  speaker_diarization_names: { ...strings("Noms des locuteurs pour Whisper"), type: ["array", "null"] },
+};
+const serviceFields = {
+  uuid: text("UUID de la destination renvoyé par check_status ou list_services"),
+  sharing: text("Visibilité SoundCloud ou Spreaker"), downloadable: bool("Autoriser le téléchargement"),
+  track_type: text("Type de piste SoundCloud"), privacy: text("Visibilité YouTube"), category: text("Catégorie YouTube"),
+  distribution: text("Distribution Facebook"), embeddable: bool("Autoriser l’intégration Facebook"),
+  draft: bool("Enregistrer en brouillon chez le diffuseur"), type: text("Type d’épisode chez le diffuseur"),
+  show: text("Émission Spreaker"), podcast: text("Identifiant du podcast RSS.com"),
+};
+
+function pickFields(data, fields) {
+  return Object.fromEntries(Object.keys(fields).filter((key) => Object.hasOwn(data ?? {}, key)).map((key) => [key, data[key]]));
+}
+
+function serviceSettings(service) {
+  const { uuid, type, ...settings } = pickFields(service, serviceFields);
+  if (settings.podcast && typeof settings.podcast === "object") settings.podcast = settings.podcast.id;
+  return settings;
+}
+
+function algorithmPatch(algorithms) {
+  const { cutter, levelermode, ...settings } = algorithms ?? {};
+  return settings;
+}
+
+function matchesSetting(actual, wanted) {
+  if (Array.isArray(wanted)) return Array.isArray(actual) && wanted.length === actual.length &&
+    wanted.every((value, index) => matchesSetting(actual[index], value));
+  if (wanted && typeof wanted === "object") return Boolean(actual) &&
+    Object.entries(wanted).every(([key, value]) => matchesSetting(actual[key], value));
+  return actual === wanted || (typeof wanted === "number" && typeof actual === "string" && actual.trim() !== "" && Number(actual) === wanted);
+}
+
+function verifyProductionChanges(args, saved) {
+  const mismatches = [];
+  for (const field of ["title", "subtitle", "summary"]) {
+    if (args[field] !== undefined && args[field] !== saved?.metadata?.[field]) mismatches.push(field);
+  }
+  if (args.basename !== undefined && args.basename !== saved?.output_basename) mismatches.push("basename");
+  if (args.algorithms && !matchesSetting(saved?.algorithms, algorithmPatch(args.algorithms))) mismatches.push("algorithms");
+  for (const track of args.multi_input_files ?? []) {
+    const actual = saved?.multi_input_files?.find((input) => input.type === "multitrack" && input.id === track.id);
+    if (!actual || (track.algorithms && !matchesSetting(actual.algorithms, algorithmPatch(track.algorithms))) ||
+      (track.offset !== undefined && !matchesSetting(actual.offset, track.offset)) ||
+      (track.keep_offset !== undefined && actual.keep_offset !== track.keep_offset)) mismatches.push("multi_input_files:" + track.id);
+  }
+  if (args.speech_recognition === null && Object.keys(saved?.speech_recognition ?? {}).length) mismatches.push("speech_recognition");
+  if (args.speech_recognition) {
+    const actual = saved?.speech_recognition;
+    if (!matchesSetting(actual, args.speech_recognition) ||
+      (args.speech_recognition.uuid === undefined && actual?.type !== "whisper")) mismatches.push("speech_recognition");
+  }
+  if (args.review_before_publishing !== undefined && saved?.review_before_publishing !== args.review_before_publishing) {
+    mismatches.push("review_before_publishing");
+  }
+  const services = saved?.outgoing_services ?? [];
+  if (args.outgoing_services && (services.length !== args.outgoing_services.length ||
+    args.outgoing_services.some(({ uuid, type, ...wanted }) => !services.some((service) =>
+      service.uuid === uuid && matchesSetting(serviceSettings(service), wanted))))) mismatches.push("outgoing_services");
+  if (args.remove_outgoing_services?.some((id) => services.some((service) => service.uuid === id))) mismatches.push("remove_outgoing_services");
+  if (args.output_files) {
+    const remaining = [...(saved?.output_files ?? [])];
+    for (const wanted of args.output_files) {
+      const index = remaining.findIndex((file) => matchesSetting(file, wanted));
+      if (index < 0) { mismatches.push("output_files"); break; }
+      remaining.splice(index, 1);
+    }
+    if (remaining.length && !mismatches.includes("output_files")) mismatches.push("output_files");
+  }
+  if (mismatches.length) throw new ToolError("PRODUCTION_UPDATE_UNCONFIRMED",
+    "Auphonic n’a pas confirmé tous les réglages demandés.", { unconfirmed_fields: mismatches });
+}
+
+function productionChanges(args, current) {
+  const path = productionPath(args.production_uuid);
+  const steps = [];
+  const post = (name, suffix, body) => steps.push({ name, path: path + suffix, method: "POST", body });
+  const clear = (name, suffix) => steps.push({ name, path: path + suffix, method: "DELETE" });
+  const { title, subtitle, summary, basename, algorithms, multi_input_files, output_files, speech_recognition,
+    outgoing_services, remove_outgoing_services, review_before_publishing } = args;
+
+  if (outgoing_services !== undefined && remove_outgoing_services !== undefined) {
+    throw new UploadInputError("Utilisez outgoing_services pour remplacer la liste ou remove_outgoing_services pour retirer des destinations.");
+  }
+  if (algorithms) {
+    const changes = algorithmPatch(algorithms);
+    if (!Object.keys(changes).length) throw new UploadInputError("Les champs cutter et levelermode sont calculés par Auphonic. Indiquez les réglages éditables.");
+    post("algorithms", "/algorithms.json", changes);
+  }
+
+  const trackIds = new Set();
+  for (const update of multi_input_files ?? []) {
+    if ([update.algorithms, update.offset, update.keep_offset].every((value) => value === undefined)) {
+      throw new UploadInputError("Indiquez les réglages à modifier pour la piste " + update.id + ".");
+    }
+    const track = current.multi_input_files?.find((track) => track.type === "multitrack" && track.id === update.id);
+    if (!track) throw new ToolError("TRACK_NOT_FOUND", "Piste multipiste introuvable : " + update.id, { next_action: "check_status" });
+    if (trackIds.has(track.id)) throw new UploadInputError("Chaque piste ne peut être modifiée qu’une fois par appel.");
+    trackIds.add(track.id);
+    const changes = algorithmPatch(update.algorithms);
+    if (update.algorithms && !Object.keys(changes).length) throw new UploadInputError("Indiquez les algorithmes éditables de la piste " + update.id + ".");
+    post("multi_input_files:" + track.id, "/multi_input_files/" + encodeURIComponent(track.id) + ".json", {
+      type: "multitrack", id: track.id,
+      algorithms: update.algorithms ? { ...algorithmPatch(track.algorithms), ...changes } : undefined,
+      // The track API resets timing fields when they are omitted.
+      offset: update.offset ?? track.offset ?? 0, keep_offset: update.keep_offset ?? track.keep_offset ?? false,
+    });
+  }
+
+  if (speech_recognition === null) {
+    if (current.speech_recognition && Object.keys(current.speech_recognition).length) clear("speech_recognition", "/speech_recognition.json");
+  } else if (speech_recognition !== undefined) {
+    if (!speech_recognition.language.trim()) throw new UploadInputError("Indiquez une langue de transcription ou auto.");
+    if (speech_recognition.uuid !== undefined) uuid(speech_recognition.uuid, "speech_recognition.uuid");
+    post("speech_recognition", "/speech_recognition.json", speech_recognition);
+  }
+
+  let publicationChanged = false;
+  if (outgoing_services !== undefined || remove_outgoing_services !== undefined) {
+    const existing = new Map((current.outgoing_services ?? []).map((service) => [service.uuid, service]));
+    const removed = new Set((remove_outgoing_services ?? []).map((id) => uuid(id, "remove_outgoing_services")));
+    const wanted = outgoing_services ?? [...existing.keys()].filter((id) => !removed.has(id)).map((uuid) => ({ uuid }));
+    const selected = new Set(wanted.map((service) => uuid(service.uuid, "outgoing_services.uuid")));
+    if (selected.size !== wanted.length) throw new UploadInputError("Chaque destination doit avoir un UUID distinct.");
+    const replaces = [...existing.keys()].some((id) => !selected.has(id));
+    if (replaces) clear("outgoing_services", "/outgoing_services.json");
+    const additions = wanted.filter((service) => replaces || !existing.has(service.uuid) || Object.keys(service).length > 1);
+    if (additions.length) post("outgoing_services", "/outgoing_services.json",
+      additions.map((service) => ({ ...serviceSettings(existing.get(service.uuid) ?? {}), ...service })));
+    publicationChanged = replaces || additions.length > 0;
+  }
+
+  if (output_files !== undefined) {
+    for (const file of output_files) {
+      if (!file.format.trim()) throw new UploadInputError("Chaque sortie doit préciser son format Auphonic.");
+      for (const service of file.outgoing_services ?? []) uuid(service, "output_files.outgoing_services");
+    }
+    // Changing transcription can create outputs. Apply the explicit output list afterward.
+    if (current.output_files?.length || speech_recognition !== undefined) clear("output_files", "/output_files.json");
+    if (output_files.length) post("output_files", "/output_files.json", output_files);
+  }
+
+  const review = review_before_publishing ?? (publicationChanged ? current.review_before_publishing : undefined);
+  if ([title, subtitle, summary, basename, review].some((value) => value !== undefined)) {
+    post("production_settings", ".json", {
+      metadata: [title, subtitle, summary].some((value) => value !== undefined) ? { title, subtitle, summary } : undefined,
+      output_basename: basename, review_before_publishing: review,
+    });
+  }
+  return steps;
+}
+
+const draftSettings = ["algorithms", "multi_input_files", "output_files", "speech_recognition", "outgoing_services",
+  "remove_outgoing_services", "review_before_publishing"];
+
+tool("update_production", "Modifie les réglages d’un brouillon sans le démarrer ni le publier. Consultez check_status pour connaître ses réglages effectifs. Les listes output_files et outgoing_services, si fournies, définissent la liste finale.", {
   production_uuid: productionId, title: titleField, subtitle: text("Sous-titre"), summary: text("Résumé"),
   basename: text("Nom de base des fichiers de sortie"),
-}, ["production_uuid"], write, async ({ production_uuid, title, subtitle, summary, basename }, env) => {
-  if ([title, subtitle, summary, basename].every((value) => value === undefined)) throw new UploadInputError("Fournissez au moins un champ à modifier.");
+  algorithms: algorithmSettings({ ...trackAlgorithmFields, ...masterAlgorithmFields }, "Réglages du master ou de la production mono. En multipiste, réglez le filtrage et le débruitage dans multi_input_files."),
+  multi_input_files: {
+    type: "array", minItems: 1, description: "Réglages des pistes multipistes existantes. Utilisez les identifiants exacts renvoyés par check_status.",
+    items: object({ id: text("Identifiant de la piste"), algorithms: algorithmSettings(trackAlgorithmFields, "Réglages Auphonic de cette piste."),
+      offset: { ...number("Décalage en secondes"), minimum: 0 }, keep_offset: bool("Conserver le décalage lors de la synchronisation"),
+    }, "Modifie les réglages d’une piste. Les autres pistes et le fichier associé sont conservés.", ["id"]),
+  },
+  output_files: { type: "array", items: object(outputFields, "Configuration d’une sortie Auphonic", ["format"]),
+    description: "Liste finale des sorties. Omettez le champ pour les conserver et envoyez [] pour les retirer." },
+  speech_recognition: { ...object(speechFields, "Configuration de transcription. Indiquez language, et uuid pour un moteur externe. null désactive la transcription.", ["language"]), type: ["object", "null"] },
+  outgoing_services: { type: "array", items: object(serviceFields, "Configuration d’une destination de publication", ["uuid"]),
+    description: "Liste finale des destinations. Omettez le champ pour les conserver et envoyez [] pour les retirer." },
+  remove_outgoing_services: strings("UUID des destinations à retirer du brouillon. Conserve les autres destinations. Incompatible avec outgoing_services."),
+  review_before_publishing: bool("Exiger une validation avant la publication vers les destinations configurées"),
+}, ["production_uuid"], { ...write, destructiveHint: true }, async (args, env) => {
+  const { production_uuid } = args;
+  if (Object.keys(args).length < 2) throw new UploadInputError("Fournissez au moins un champ à modifier.");
   const path = productionPath(production_uuid) + ".json";
   const current = await api(env, path);
-  if (current.change_allowed === false) throw new ToolError("PRODUCTION_NOT_EDITABLE", "Cette production ne peut pas être modifiée.", { production_uuid });
-  return productionDetails(await api(env, path, { method: "POST", body: {
-    metadata: title !== undefined || subtitle !== undefined || summary !== undefined ? { title, subtitle, summary } : undefined,
-    output_basename: basename,
-  } }), production_uuid, env);
+  if (current.change_allowed === false || (draftSettings.some((key) => Object.hasOwn(args, key)) && !uploadableStatuses.has(current.status))) {
+    throw new ToolError("PRODUCTION_NOT_EDITABLE", "Ces réglages peuvent être modifiés sur un brouillon éditable.", {
+      production_uuid, next_action: "check_status",
+    });
+  }
+  const steps = productionChanges(args, current);
+  const completed = [];
+  try {
+    for (const step of steps) {
+      await api(env, step.path, { method: step.method, body: step.body });
+      completed.push({ name: step.name, method: step.method });
+    }
+    const saved = steps.length ? await api(env, path) : current;
+    verifyProductionChanges(args, saved);
+    return productionDetails(saved, production_uuid, env);
+  } catch (error) {
+    const saved = await api(env, path).catch(() => null);
+    throw new ToolError(error.code ?? "PRODUCTION_UPDATE_FAILED", error.message, {
+      ...error.details, retryable: false, production_uuid, completed, next_action: "check_status",
+      attempted: steps[completed.length]?.name,
+      production: saved ? productionDetails(saved, production_uuid, env) : undefined,
+    });
+  }
 });
 
 tool("upload_production_file", "Envoie ou remplace une pièce jointe dans un brouillon Auphonic existant. En multipiste, indiquez le nom de la piste renvoyé par check_status. En mono, omettez track.", {
@@ -447,10 +682,13 @@ function jsonError(id, code, message) {
 }
 
 function validateArgument(name, value, schema) {
-  const type = schema.type;
+  const declared = Array.isArray(schema.type) ? schema.type : [schema.type];
+  if (value === null && declared.includes("null")) return;
+  const type = declared.find((type) => type !== "null");
   const valid = type === "object" ? value !== null && typeof value === "object" && !Array.isArray(value)
     : type === "array" ? Array.isArray(value)
     : type === "integer" ? Number.isSafeInteger(value)
+    : type === "number" ? Number.isFinite(value)
     : typeof value === type;
   if (!valid || (schema.enum && !schema.enum.includes(value)) || value < schema.minimum || value > schema.maximum) {
     throw new ToolError("INVALID_ARGUMENT", "Argument invalide : " + name);
@@ -460,13 +698,14 @@ function validateArgument(name, value, schema) {
     value.forEach((item) => validateArgument(name, item, schema.items));
   }
   if (type !== "object") return;
+  if (Object.keys(value).length < schema.minProperties) throw new ToolError("INVALID_ARGUMENT", "Précisez au moins un réglage : " + name);
   for (const field of schema.required ?? []) {
     if (!Object.hasOwn(value, field)) throw new ToolError("INVALID_ARGUMENT", "Argument requis : " + field);
   }
   for (const [key, item] of Object.entries(value)) {
     const property = Object.hasOwn(schema.properties ?? {}, key) ? schema.properties[key] : schema.additionalProperties;
     if (property === false) throw new ToolError("INVALID_ARGUMENT", "Argument inconnu : " + key);
-    if (property) validateArgument(key, item, property);
+    if (property && property !== true) validateArgument(name + "." + key, item, property);
   }
 }
 

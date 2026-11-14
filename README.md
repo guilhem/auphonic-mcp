@@ -17,3 +17,9 @@ Les fichiers d’entrée proviennent d’URL directes ou de services externes as
 Le formulaire sur la page d’accueil envoie les fichiers à Auphonic sans les conserver sur le site. Il permet de créer un brouillon avec un mix ou 2 à 8 pistes distinctes, jusqu’à 90 Mio par fichier. En multipiste, choisir un préréglage multipiste et vérifier les noms proposés. En cas d’interruption, le même formulaire peut reprendre à la piste en cours tant que la page reste ouverte. Les fichiers plus volumineux peuvent être transmis avec les outils MCP depuis un stockage connecté ou une URL directe.
 
 Le champ `file` de `upload_audio` accepte une pièce jointe ChatGPT si le client prend en charge les paramètres de fichier. Les champs `input_url` et `service` restent disponibles.
+
+### Multipiste depuis le MCP
+
+Joindre les enregistrements à la conversation, puis appeler `start_multitrack_production` avec les pièces jointes dans `files` et les noms correspondants dans `track_names`. Par exemple, pour `hote.wav` puis `invite.wav`, utiliser `track_names: ["Hôte", "Invité"]`. Le client MCP doit prendre en charge les paramètres de fichier. Un chemin local seul ne transmet pas le fichier au serveur.
+
+Le Worker crée un seul brouillon Auphonic et envoie les enregistrements en multipart, chacun dans le champ portant le nom de sa piste. `dry_run: true` affiche la correspondance et `action: "start"` lance le traitement après vérification des pistes. Par défaut, le brouillon reste disponible pour vérification manuelle.

@@ -1,4 +1,4 @@
-const serverInfo = { name: "auphonic-mcp", version: "1.1.0" };
+const serverInfo = { name: "auphonic-mcp", version: "1.2.0" };
 const version = "2026-07-28";
 const capabilities = { tools: {}, resources: {}, prompts: {} };
 const text = (description) => ({ type: "string", description });
@@ -189,14 +189,19 @@ async function inferTracks(env, service, episode, names) {
   });
 }
 
-tool("start_multitrack_production", "Prépare ou démarre une production multipiste depuis des URL audio ou un stockage connecté à Auphonic. dry_run affiche le plan sans créer de production.", {
+tool("start_multitrack_production", "Prépare ou démarre une production multipiste depuis des pièces jointes ChatGPT, des URL audio ou un stockage connecté à Auphonic. Pour les pièces jointes, associez chaque fichier à son nom de piste dans le même ordre. dry_run affiche le plan sans créer de production.", {
   ...presetFields, service: text("UUID ou nom du service externe Auphonic"), episode: integer("Numéro d’épisode pour identifier les fichiers", 1),
   tracks: { type: "object", additionalProperties: { type: "string" }, description: "Association piste → URL directe, ou piste → fichier si service est renseigné." },
+  files: { type: "array", items: attachment, minItems: 2, maxItems: 8, description: "Pièces jointes audio dans l’ordre de track_names." },
+  track_names: { type: "array", items: text("Nom de piste Auphonic"), minItems: 2, maxItems: 8,
+    description: "Nom de chaque piste, dans le même ordre que files." },
   skip_tracks: { type: "array", items: { type: "string" } }, title: titleField,
   basename: text("Nom de base des fichiers de sortie"), action: actionField, dry_run: { type: "boolean" },
 }, [], write, async (args, env) => {
   const mode = action(args.action);
   const preset = presetFor(args, env);
+  if (args.files) return await uploadMultitrack(env, args, preset, mode);
+  if (args.track_names) throw new UploadInputError("Fournissez les pièces jointes dans files avec track_names.");
   const config = await api(env, "/preset/" + preset + ".json");
   const existing = (config?.multi_input_files ?? []).filter((track) => track.type === "multitrack" && track.id);
   const byId = new Map(existing.map((track) => [track.id.toLowerCase(), track]));
@@ -259,6 +264,8 @@ tool("start_multitrack_production", "Prépare ou démarre une production multipi
   }
 });
 
+tools.start_multitrack_production._meta = { "openai/fileParams": ["files"] };
+
 const prompts = {
   upload_and_process: { description: "Préparer un fichier audio pour Auphonic", message: "Sélectionne un préréglage, demande une URL audio directe et prépare un brouillon avec upload_audio." },
   analyze_production: { description: "Consulter une production", message: "Demande l’UUID de la production si nécessaire, puis consulte son statut avec check_status." },
@@ -281,7 +288,10 @@ function validateArgument(name, value, schema) {
   if (!valid || (schema.enum && !schema.enum.includes(value)) || value < schema.minimum || value > schema.maximum) {
     throw Error("Argument invalide : " + name);
   }
-  if (type === "array") value.forEach((item) => validateArgument(name, item, schema.items));
+  if (type === "array") {
+    if (value.length < schema.minItems || value.length > schema.maxItems) throw Error("Nombre d’éléments invalide : " + name);
+    value.forEach((item) => validateArgument(name, item, schema.items));
+  }
   if (type !== "object") return;
   for (const field of schema.required ?? []) {
     if (!Object.hasOwn(value, field)) throw Error("Argument requis : " + field);
@@ -374,7 +384,7 @@ function audioSize(value, maximum) {
   return size;
 }
 
-async function openAttachment(file) {
+function resolveAttachment(file) {
   let url;
   try { url = new URL(file.download_url); } catch { throw new UploadInputError("URL de pièce jointe invalide."); }
   const allowed = /(?:^|\.)(?:oaiusercontent\.com|oaistatic\.com|chatgpt\.com)$/.test(url.hostname) ||
@@ -383,7 +393,14 @@ async function openAttachment(file) {
   if (url.protocol !== "https:" || !allowed || url.username || url.password || url.port) {
     throw new UploadInputError("Utilisez une pièce jointe ChatGPT ou le champ input_url pour une URL externe.");
   }
-  const name = audioName(file.file_name, file.mime_type);
+  return { url, name: audioName(file.file_name, file.mime_type) };
+}
+
+function openAttachment(file) {
+  return downloadAttachment(resolveAttachment(file));
+}
+
+async function downloadAttachment({ url, name }) {
   const response = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(5 * 60 * 1000) });
   try {
     if (!response.ok || !response.body) throw new UploadInputError("Pièce jointe inaccessible. Joignez-la de nouveau ou utilisez le formulaire du site.");
@@ -395,15 +412,22 @@ async function openAttachment(file) {
   }
 }
 
-function multipartAudio(fields, fieldName, source) {
+function multipartAudio(fields, files) {
   const boundary = "auphonic-" + crypto.randomUUID();
   const quoted = (value) => value.replaceAll('"', "%22").replaceAll("\r", "").replaceAll("\n", "").replaceAll("\\", "%5C");
   const metadata = Object.entries(fields).filter(([, value]) => value !== undefined && value !== "").map(([key, value]) =>
     "--" + boundary + '\r\nContent-Disposition: form-data; name="' + key + '"\r\n\r\n' + value + "\r\n").join("");
-  const prefix = encode.encode(metadata + "--" + boundary + '\r\nContent-Disposition: form-data; name="' +
-    quoted(fieldName) + '"; filename="' + quoted(source.name) + '"\r\nContent-Type: application/octet-stream\r\n\r\n');
-  const suffix = encode.encode("\r\n--" + boundary + "--\r\n");
-  const parts = [new Blob([prefix]).stream(), source.body, new Blob([suffix]).stream()];
+  const parts = [new Blob([metadata]).stream()];
+  let size = encode.encode(metadata).length;
+  for (const [fieldName, source] of files) {
+    const header = new Blob(["--" + boundary + '\r\nContent-Disposition: form-data; name="' +
+      quoted(fieldName) + '"; filename="' + quoted(source.name) + '"\r\nContent-Type: application/octet-stream\r\n\r\n']);
+    parts.push(header.stream(), source.body, new Blob(["\r\n"]).stream());
+    size += header.size + source.size + 2;
+  }
+  const footer = new Blob(["--" + boundary + "--\r\n"]);
+  parts.push(footer.stream());
+  size += footer.size;
   let reader;
   const joined = new ReadableStream({
     async pull(controller) {
@@ -423,20 +447,20 @@ function multipartAudio(fields, fieldName, source) {
       await Promise.allSettled([reader?.cancel(reason), ...parts.map((part) => part.cancel(reason))]);
     },
   });
-  const fixed = typeof FixedLengthStream === "function" ? new FixedLengthStream(prefix.length + source.size + suffix.length) : null;
+  const fixed = typeof FixedLengthStream === "function" ? new FixedLengthStream(size) : null;
   return { body: fixed ? joined.pipeThrough(fixed) : joined, contentType: "multipart/form-data; boundary=" + boundary };
 }
 
-function sendAudio(env, path, fields, fieldName, source) {
+function sendAudio(env, path, fields, files) {
   return api(env, path, {
-    method: "POST", multipart: multipartAudio(fields, fieldName, source), timeout: 5 * 60 * 1000,
+    method: "POST", multipart: multipartAudio(fields, files), timeout: 5 * 60 * 1000,
   });
 }
 
 async function uploadSingle(env, { preset, title, subtitle, summary, type, mode = "save" }, source) {
   const data = await sendAudio(env, "/simple/productions.json", {
     preset, title, subtitle, summary, tags: type, action: mode,
-  }, "input_file", source);
+  }, [["input_file", source]]);
   return productionDetails(data, uuid(data?.uuid, "UUID de la production créée"));
 }
 
@@ -451,7 +475,7 @@ function trackName(value) {
   return name;
 }
 
-async function createUploadDraft(env, { preset, title, names }) {
+async function planUploadDraft(env, { preset, title, basename, names }) {
   if (!Array.isArray(names) || names.length < 2 || names.length > maxTracks) {
     throw new UploadInputError("Sélectionnez entre 2 et 8 pistes pour le multipiste.");
   }
@@ -467,27 +491,81 @@ async function createUploadDraft(env, { preset, title, names }) {
   const tracks = ids.map((id) => byId.get(id.toLowerCase())?.id ?? id);
   const wanted = new Set(tracks);
   const append = tracks.filter((id) => !byId.has(id.toLowerCase())).map((id) => ({ id, type: "multitrack", algorithms: template }));
-  const body = { preset, is_multitrack: true, metadata: title ? { title } : undefined };
+  const drop = existing.filter((track) => !wanted.has(track.id)).map((track) => track.id);
+  const body = { preset, is_multitrack: true, metadata: title ? { title } : undefined, output_basename: basename };
   if (!existing.length) body.multi_input_files = append;
+  return { body, tracks, drop, append: existing.length ? append : [] };
+}
+
+function uploadedTracks(production, expected, requireFiles = false) {
+  const tracks = (production?.multi_input_files ?? []).filter((track) => track.type === "multitrack");
+  const ids = new Set(tracks.map((track) => track.id));
+  return tracks.length === expected.length && ids.size === expected.length &&
+    expected.every((id) => ids.has(id)) && (!requireFiles || tracks.every((track) => track.input_file));
+}
+
+async function createUploadDraft(env, plan) {
+  const { body, tracks, drop, append } = plan;
   const draft = await api(env, "/productions.json", { method: "POST", body });
   const id = uuid(draft?.uuid, "UUID de la production créée");
   const path = productionPath(id);
   try {
-    for (const track of existing.filter((track) => !wanted.has(track.id))) {
-      await api(env, path + "/multi_input_files/" + encodeURIComponent(track.id) + ".json", { method: "DELETE" });
+    for (const id of drop) {
+      await api(env, path + "/multi_input_files/" + encodeURIComponent(id) + ".json", { method: "DELETE" });
     }
-    if (existing.length && append.length) {
+    if (append.length) {
       await api(env, path + ".json", { method: "POST", body: { multi_input_files: append } });
     }
     const saved = await api(env, path + ".json");
-    const actual = (saved?.multi_input_files ?? []).filter((track) => track.type === "multitrack");
-    if (actual.length !== tracks.length || new Set(actual.map((track) => track.id)).size !== wanted.size ||
-        actual.some((track) => !wanted.has(track.id))) {
+    if (!uploadedTracks(saved, tracks)) {
       throw Error("Auphonic a enregistré une liste de pistes différente.");
     }
     return { ...productionDetails(saved, id), upload_tracks: tracks };
   } catch (error) {
     throw Error(error.message + " Le brouillon " + id + " a été créé. Vérifiez-le sur Auphonic avant de réessayer.");
+  }
+}
+
+async function uploadMultitrack(env, args, preset, mode) {
+  if (args.tracks || args.service || args.episode) {
+    throw new UploadInputError("Utilisez files et track_names ensemble pour un téléversement local.");
+  }
+  if (args.files.length !== args.track_names?.length) {
+    throw new UploadInputError("Indiquez exactement un nom de piste par pièce jointe.");
+  }
+  const skip = new Set((args.skip_tracks ?? []).map((name) => name.trim().toLowerCase()));
+  const entries = args.track_names.map((name, i) => [trackName(name), args.files[i]])
+    .filter(([name]) => !skip.has(name.toLowerCase()));
+  const files = entries.map(([, file]) => resolveAttachment(file));
+  if (new Set(entries.map(([, file]) => file.file_id)).size !== entries.length) {
+    throw new UploadInputError("Chaque piste doit utiliser une pièce jointe distincte.");
+  }
+  const plan = await planUploadDraft(env, { preset, title: args.title, basename: args.basename, names: entries.map(([name]) => name) });
+  const mapping = plan.tracks.map((track, i) => ({ track, file: files[i].name }));
+  if (preview(args.dry_run)) return { dry_run: true, preset, tracks: mapping, start: mode === "start" };
+
+  const draft = await createUploadDraft(env, plan);
+  const path = productionPath(draft.uuid);
+  try {
+    // Two files fit in the same multipart request while keeping the number of
+    // open attachment streams bounded for setups with more tracks.
+    for (let index = 0; index < files.length; index += 2) {
+      const sources = [];
+      try {
+        for (const file of files.slice(index, index + 2)) {
+          sources.push([plan.tracks[index + sources.length], await downloadAttachment(file)]);
+        }
+        await sendAudio(env, path + "/upload.json", {}, sources);
+      } finally {
+        await Promise.allSettled(sources.map(([, source]) => source.body.cancel()));
+      }
+    }
+    const saved = await api(env, path + ".json");
+    if (!uploadedTracks(saved, plan.tracks, true)) throw Error("Auphonic n’a pas confirmé le fichier de chaque piste.");
+    if (mode === "start") return await tools.start_production.run({ production_uuid: draft.uuid }, env);
+    return { ...productionDetails(saved, draft.uuid), uploaded_files: mapping };
+  } catch (error) {
+    throw Error(error.message + " Vérifiez la production " + draft.uuid + " sur Auphonic avant de réessayer.");
   }
 }
 
@@ -510,7 +588,8 @@ async function uploadRoute(request, url, env) {
       if (!payload || typeof payload.preset !== "string" || typeof payload.title !== "string" || payload.title.length > 200) {
         throw new UploadInputError("Indiquez un préréglage et un titre valide.");
       }
-      return Response.json(await createUploadDraft(env, { ...payload, preset: presetFor(payload, env) }));
+      const plan = await planUploadDraft(env, { ...payload, preset: presetFor(payload, env) });
+      return Response.json(await createUploadDraft(env, plan));
     }
     if (request.headers.get("Content-Type") !== "application/octet-stream" || !request.body) {
       throw new UploadInputError("Aucun fichier audio reçu.");
@@ -531,7 +610,7 @@ async function uploadRoute(request, url, env) {
     if (!uploadableStatuses.has(draft?.status) || !draft.multi_input_files?.some((input) => input.type === "multitrack" && input.id === track)) {
       throw new UploadInputError("La piste est introuvable dans un brouillon multipiste modifiable.");
     }
-    await sendAudio(env, production + "/upload.json", {}, track, source);
+    await sendAudio(env, production + "/upload.json", {}, [[track, source]]);
     return Response.json({ track, uuid: id, url: productionUrl(id) });
   } catch (error) {
     return Response.json({ error: error.message }, { status: error.status ?? 502, headers: { "Cache-Control": "no-store" } });

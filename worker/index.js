@@ -1,15 +1,15 @@
-const serverInfo = { name: "auphonic-mcp", version: "1.2.0" };
+const serverInfo = { name: "auphonic-mcp", version: "1.3.0" };
 const version = "2026-07-28";
 const capabilities = { tools: {}, resources: {}, prompts: {} };
 const text = (description) => ({ type: "string", description });
 const integer = (description, minimum = 0) => ({ type: "integer", description, minimum });
 const productionId = text("Auphonic production UUID");
 const presetFields = {
-  preset: text("Auphonic preset UUID. Takes precedence over show."),
-  show: text("Show name configured as AUPHONIC_PRESET_<SHOW>, e.g. mon_podcast."),
+  preset: text("UUID du préréglage Auphonic. Prioritaire si show est aussi renseigné."),
+  show: text("Alias d’émission configuré par le propriétaire. Fournissez preset ou show."),
 };
-const actionField = { type: "string", enum: ["save", "start"], description: "Save a draft (default) or start processing, which consumes credits." };
-const titleField = text("Episode title");
+const actionField = { type: "string", enum: ["save", "start"], description: "save enregistre un brouillon par défaut. start peut consommer des crédits et déclencher les publications du préréglage." };
+const titleField = text("Titre de l’épisode");
 const tools = {};
 function tool(name, description, properties, required, annotations, run) {
   tools[name] = { name, description, inputSchema: { type: "object", properties, required, additionalProperties: false }, annotations, run };
@@ -17,13 +17,27 @@ function tool(name, description, properties, required, annotations, run) {
 const readOnly = { readOnlyHint: true, openWorldHint: true };
 const write = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
 const uuid = (value, field) => {
-  if (typeof value !== "string" || !/^[a-zA-Z0-9_-]{1,80}$/.test(value)) throw Error(field + " invalide.");
+  if (typeof value !== "string" || !/^[a-zA-Z0-9_-]{1,80}$/.test(value)) throw new ToolError("INVALID_ARGUMENT", field + " invalide.");
   return value;
 };
 const productionPath = (id) => "/production/" + uuid(id, "production_uuid");
 const productionUrl = (id) => "https://auphonic.com" + productionPath(id);
 const records = (value) => Array.isArray(value) ? value : Object.values(value ?? {});
 const preview = (value) => ![false, 0, null, undefined, "", "false", "0", "no", "off"].includes(typeof value === "string" ? value.trim().toLowerCase() : value);
+
+class ToolError extends Error {
+  constructor(code, message, details = {}) {
+    super(message);
+    this.code = code;
+    this.details = details;
+  }
+}
+
+function publicMessage(message, env) {
+  const key = env.AUPHONIC_API_KEY?.trim();
+  const safe = key ? message.replaceAll(key, "[secret]") : message;
+  return safe.replace(/https?:\/\/[^\s<>"']+/g, (url) => url.split(/[?#]/)[0]).slice(0, 500);
+}
 
 function action(value = "save") {
   if (!["save", "start"].includes(value)) throw Error("action doit valoir save ou start.");
@@ -32,8 +46,10 @@ function action(value = "save") {
 
 function presetFor(args, env) {
   const show = args.show?.trim().toUpperCase().replaceAll("-", "_");
-  if (show && !/^[A-Z0-9_]+$/.test(show)) throw Error("Nom d’émission invalide.");
-  return uuid(args.preset ?? (show ? env["AUPHONIC_PRESET_" + show] : undefined), "preset (UUID ou émission configurée)");
+  if (show && !/^[A-Z0-9_]+$/.test(show)) throw new ToolError("INVALID_ARGUMENT", "Nom d’émission invalide.");
+  const preset = args.preset ?? (show ? env["AUPHONIC_PRESET_" + show] : undefined);
+  if (!preset) throw new ToolError("PRESET_REQUIRED", "Fournissez un UUID de list_presets ou un alias d’émission configuré.", { next_action: "list_presets" });
+  return uuid(preset, "preset");
 }
 
 async function api(env, path, { method = "GET", body, query, multipart, timeout = 15000 } = {}) {
@@ -51,26 +67,65 @@ async function api(env, path, { method = "GET", body, query, multipart, timeout 
     body: multipart?.body ?? (body === undefined ? undefined : JSON.stringify(body)),
     ...(multipart ? { duplex: "half" } : {}),
     signal: AbortSignal.timeout(timeout),
+  }).catch(() => {
+    throw new ToolError("AUPHONIC_UNREACHABLE", "Auphonic ne répond pas.", { retryable: method === "GET" });
   });
   if (response.status === 204) return null;
   const result = await response.json().catch(() => null);
   if (!response.ok || !result || Number(result.status_code) >= 400) {
-    const detail = typeof result?.error_message === "string"
-      ? result.error_message.replaceAll(key, "[secret]").slice(0, 500)
-      : "";
-    throw Error("Auphonic HTTP " + (result?.status_code ?? response.status) + (detail ? " — " + detail : ""));
+    const status = Number(result?.status_code) || response.status;
+    const detail = typeof result?.error_message === "string" ? publicMessage(result.error_message, env) : "";
+    throw new ToolError(status === 404 ? "NOT_FOUND" : "AUPHONIC_ERROR",
+      "Auphonic HTTP " + status + (detail ? " — " + detail : ""), {
+        upstream_status: status, retryable: method === "GET" && (status === 429 || status >= 500),
+      });
   }
   return result.data;
 }
 
-function productionDetails(data, fallback) {
+function fileLabel(value) {
+  if (!value) return undefined;
+  if (!/^https?:\/\//i.test(value)) return value;
+  try {
+    const url = new URL(value);
+    const basename = url.pathname.split("/").filter(Boolean).at(-1);
+    return basename ? url.origin + "/" + basename : url.origin;
+  } catch { return "[URL]"; }
+}
+
+function outputDetails(files) {
+  return (files ?? []).map(({ filename, format, ending, size, outgoing_services }) =>
+    ({ filename, format, ending, size_bytes: size, outgoing_services }));
+}
+
+function destinations(data) {
+  return (data?.outgoing_services ?? []).map(({ uuid, display_name, type, transfer_success }) =>
+    ({ uuid, name: display_name, type, transfer_success }));
+}
+
+function trackDetails({ id, type, input_file, service, algorithms, offset }) {
+  return { id, type, file: fileLabel(input_file), has_input: Boolean(input_file), service, algorithms, offset_seconds: offset };
+}
+
+function productionDetails(data, fallback, env = {}) {
   const id = data?.uuid ?? fallback;
   return {
     uuid: id, url: id ? productionUrl(id) : undefined, title: data?.metadata?.title,
     status: data?.status, status_string: data?.status_string, length: data?.length,
-    updated_at: data?.change_time,
-    tracks: data?.multi_input_files?.map(({ id, type }) => ({ id, type })),
-    outputs: data?.output_files?.map(({ filename, format, ending }) => ({ filename, format, ending })),
+    updated_at: data?.change_time, is_multitrack: data?.is_multitrack,
+    start_allowed: data?.start_allowed, change_allowed: data?.change_allowed,
+    error: data?.error_message ? { status: data.error_status, message: publicMessage(data.error_message, env) } : undefined,
+    warnings: data?.warning_message ? [{ status: data.warning_status, message: publicMessage(data.warning_message, env) }] : [],
+    input_file: fileLabel(data?.input_file), tracks: (data?.multi_input_files ?? []).map(trackDetails),
+    outputs: outputDetails(data?.output_files), destinations: destinations(data),
+  };
+}
+
+function presetDetails(data, id) {
+  return {
+    uuid: data?.uuid ?? id, preset_name: data?.preset_name, is_multitrack: data?.is_multitrack,
+    tracks: (data?.multi_input_files ?? []).map(trackDetails), algorithms: data?.algorithms,
+    outputs: outputDetails(data?.output_files), destinations: destinations(data),
   };
 }
 
@@ -89,40 +144,89 @@ async function resolveService(env, reference) {
   const services = records(await api(env, "/services.json"));
   const matches = services.filter((service) => service.uuid === lookup ||
     service.display_name?.toLowerCase() === lookup.toLowerCase());
-  if (matches.length !== 1) throw Error(matches.length ? "Nom de service ambigu. Utilisez son UUID." : "Service Auphonic introuvable.");
-  if (matches[0].incoming === false) throw Error("Ce service est réservé à la publication.");
+  if (matches.length !== 1) throw new ToolError(matches.length ? "AMBIGUOUS_SERVICE" : "NOT_FOUND",
+    matches.length ? "Nom de service ambigu. Utilisez son UUID." : "Service Auphonic introuvable.");
+  if (matches[0].incoming === false) throw new ToolError("INVALID_ARGUMENT", "Ce service est réservé à la publication.");
   return uuid(matches[0].uuid, "service");
 }
 
 tool("list_presets", "Liste les préréglages Auphonic et leurs UUID.", {}, [], readOnly, async (args, env) =>
-  records(await api(env, "/presets.json")).map(({ uuid, preset_name }) => ({ uuid, preset_name })));
+  records(await api(env, "/presets.json", { query: { minimal_data: 1 } })).map(({ uuid, preset_name, is_multitrack }) => ({ uuid, preset_name, is_multitrack })));
+
+tool("get_preset", "Consulte le mode mono ou multipiste, les pistes, les traitements, les sorties et les destinations d’un préréglage. Fournissez preset ou show.", presetFields, [], readOnly, async (args, env) => {
+  const id = presetFor(args, env);
+  return presetDetails(await api(env, "/preset/" + id + ".json"), id);
+});
+
+tool("list_services", "Liste les services Auphonic configurés et indique ceux qui acceptent des fichiers en entrée.", {}, [], readOnly, async (args, env) =>
+  records(await api(env, "/services.json")).map(({ uuid, display_name, type, incoming, outgoing }) =>
+    ({ uuid, name: display_name, type, incoming, outgoing })));
+
+tool("list_service_files", "Liste les fichiers média accessibles sur un service d’entrée Auphonic.", {
+  service: text("UUID ou nom exact renvoyé par list_services"),
+}, ["service"], readOnly, async ({ service }, env) => {
+  const id = await resolveService(env, service);
+  if (!id) throw new ToolError("INVALID_ARGUMENT", "Indiquez un service d’entrée.");
+  return { service: id, files: records(await api(env, "/service/" + id + "/ls.json")).filter((file) => typeof file === "string") };
+});
 
 tool("list_productions", "Liste les productions Auphonic avec pagination et filtre de statut.", {
   limit: { ...integer("Nombre de résultats (20 par défaut)", 1), maximum: 100 },
   offset: integer("Décalage de pagination"), status: integer("Code de statut Auphonic"),
 }, [], readOnly, async (args, env) => records(await api(env, "/productions.json", {
-  query: { limit: args.limit ?? 20, offset: args.offset, status: args.status },
-})).map((item) => productionDetails(item)));
+  query: { limit: args.limit ?? 20, offset: args.offset, status: args.status, minimal_data: 1 },
+})).map((item) => productionDetails(item, undefined, env)));
 
 tool("check_status", "Consulte le statut, les pistes et les sorties d’une production.", {
   production_uuid: productionId,
 }, ["production_uuid"], readOnly, async ({ production_uuid }, env) =>
-  productionDetails(await api(env, productionPath(production_uuid) + ".json"), production_uuid));
+  productionDetails(await api(env, productionPath(production_uuid) + ".json"), production_uuid, env));
 
-tool("download_output", "Indique les fichiers disponibles et ouvre la page Auphonic où les télécharger avec votre compte.", {
+const outputFilter = {
   production_uuid: productionId, format: text("Format ou extension (mp3, flac, vtt…)"),
-}, ["production_uuid"], readOnly, async ({ production_uuid, format }, env) => {
-  const data = await tools.check_status.run({ production_uuid }, env);
-  if (data.status !== 3) throw Error("La production n’est pas terminée.");
-  const files = data.outputs?.filter((file) => !format || file.format === format || file.ending === format) ?? [];
-  if (!files.length) throw Error("Aucun fichier disponible pour le format demandé.");
-  return { url: data.url, files };
+  filename: text("Nom exact du fichier renvoyé par list_outputs"),
+};
+
+async function listOutputs({ production_uuid, format, filename }, env, origin) {
+  const data = await api(env, productionPath(production_uuid) + ".json");
+  const files = outputDetails((data?.output_files ?? []).filter((file) =>
+    (!format || file.format === format || file.ending === format) && (!filename || file.filename === filename)));
+  for (const file of files) {
+    file.available = data.status === 3 && Boolean(resultFileUrl(data, production_uuid, file.filename));
+    if (file.available && origin) {
+      const query = new URLSearchParams({ production: production_uuid, filename: file.filename });
+      file.download_url = origin + "/api/output?" + query;
+    }
+  }
+  return { uuid: production_uuid, url: productionUrl(production_uuid), status: data?.status, files };
+}
+
+tool("list_outputs", "Liste les fichiers de sortie, leur disponibilité et les liens de téléchargement lorsque le traitement est terminé.", outputFilter, ["production_uuid"], readOnly, listOutputs);
+
+tool("download_output", "Renvoie les liens de téléchargement depuis le site privé. Utilisez filename pour choisir un fichier précis.", outputFilter, ["production_uuid"], readOnly, async (args, env, origin) => {
+  const result = await listOutputs(args, env, origin);
+  if (result.status !== 3) throw new ToolError("PRODUCTION_NOT_READY", "La production n’est pas terminée.", {
+    production_uuid: args.production_uuid, next_action: "check_status",
+  });
+  const files = result.files.filter((file) => file.available);
+  if (!files.length) throw new ToolError("OUTPUT_NOT_FOUND", "Aucun fichier téléchargeable ne correspond à la sélection.", {
+    production_uuid: args.production_uuid, next_action: "list_outputs",
+  });
+  return { ...result, files };
 });
 
-tool("start_production", "Démarre le traitement d’une production enregistrée et consomme des crédits Auphonic.", {
+tool("start_production", "Démarre le traitement d’un brouillon complet. Peut consommer des crédits et publier vers les destinations configurées.", {
   production_uuid: productionId,
-}, ["production_uuid"], write, async ({ production_uuid }, env) =>
-  productionDetails(await api(env, productionPath(production_uuid) + "/start.json", { method: "POST" }), production_uuid));
+}, ["production_uuid"], write, async ({ production_uuid }, env) => {
+  const path = productionPath(production_uuid);
+  const draft = await api(env, path + ".json");
+  if (draft?.start_allowed === false || (uploadableStatuses.has(draft?.status) && !hasRequiredInputs(draft))) {
+    throw new ToolError("PRODUCTION_NOT_READY", "Auphonic ne permet pas de démarrer cette production ou des fichiers d’entrée manquent.", {
+      production_uuid, next_action: "check_status",
+    });
+  }
+  return productionDetails(await api(env, path + "/start.json", { method: "POST" }), production_uuid, env);
+});
 
 tool("delete_production", "Supprime définitivement une production Auphonic.", {
   production_uuid: productionId,
@@ -137,22 +241,26 @@ const attachment = {
     mime_type: text("Type MIME"), file_name: text("Nom du fichier") },
   required: ["download_url", "file_id"], additionalProperties: false,
 };
+const attachments = { type: "array", items: attachment, minItems: 2, maxItems: 8,
+  description: "Deux à huit pièces jointes audio dans l’ordre de track_names. Limite serveur de 2048 Mio par fichier, sous réserve des limites du client." };
+const trackNames = { type: "array", items: text("Nom unique de la piste Auphonic"), minItems: 2, maxItems: 8,
+  description: "Deux à huit noms de pistes. Si files est renseigné, fournir un nom par fichier dans le même ordre." };
 
 tool("upload_audio", "Crée une production à partir d’une pièce jointe ChatGPT, d’une URL audio directe ou d’un fichier sur un service Auphonic. Enregistre un brouillon par défaut.", {
-  ...presetFields, file: attachment, input_url: text("URL HTTP(S) directe ou présignée"), service: text("UUID ou nom du service externe Auphonic"),
+  ...presetFields, file: { ...attachment, description: "Pièce jointe ChatGPT. Utilisez file seul, input_url seul ou service et input_file ensemble." }, input_url: text("URL HTTP(S) directe ou présignée"), service: text("UUID ou nom du service externe Auphonic"),
   input_file: text("Nom du fichier sur le service externe"), title: titleField, subtitle: text("Sous-titre"),
   summary: text("Résumé"), type: text("Tag de catégorie"), action: actionField,
 }, [], write, async (args, env) => {
   const mode = action(args.action);
   const preset = presetFor(args, env);
   if (args.file) {
-    if (args.input_url || args.service || args.input_file) throw Error("Indiquez une seule source audio.");
+    if (args.input_url !== undefined || args.service !== undefined || args.input_file !== undefined) throw new UploadInputError("Indiquez une seule source audio.");
     const source = await openAttachment(args.file);
     return await uploadSingle(env, { ...args, preset, mode }, source);
   }
-  const fromService = Boolean(args.service && args.input_file);
-  if (args.input_url ? args.service || args.input_file : !fromService) {
-    throw Error("Fournissez input_url, ou bien service et input_file ensemble.");
+  const fromService = Boolean(args.service?.trim() && args.input_file?.trim());
+  if (args.input_url !== undefined ? args.service !== undefined || args.input_file !== undefined : !fromService) {
+    throw new UploadInputError("Fournissez input_url, ou bien service et input_file ensemble.");
   }
   const service = fromService ? await resolveService(env, args.service) : undefined;
   const metadata = { title: args.title, subtitle: args.subtitle, summary: args.summary, tags: args.type ? [args.type] : undefined };
@@ -160,7 +268,7 @@ tool("upload_audio", "Crée une production à partir d’une pièce jointe ChatG
     preset, service, input_file: fromService ? args.input_file : remoteUrl(args.input_url), metadata,
     action: mode === "start" ? mode : undefined,
   };
-  return productionDetails(await api(env, "/productions.json", { method: "POST", body }));
+  return productionDetails(await api(env, "/productions.json", { method: "POST", body }), undefined, env);
 });
 
 tools.upload_audio._meta = { "openai/fileParams": ["file"] };
@@ -189,12 +297,10 @@ async function inferTracks(env, service, episode, names) {
   });
 }
 
-tool("start_multitrack_production", "Prépare ou démarre une production multipiste depuis des pièces jointes ChatGPT, des URL audio ou un stockage connecté à Auphonic. Pour les pièces jointes, associez chaque fichier à son nom de piste dans le même ordre. dry_run affiche le plan sans créer de production.", {
+tool("start_multitrack_production", "Crée un brouillon multipiste. Fournissez preset ou show et choisissez une source : files avec track_names, tracks explicites, ou service avec episode. Les pistes fournies remplacent les pistes multipistes du préréglage. dry_run affiche le plan.", {
   ...presetFields, service: text("UUID ou nom du service externe Auphonic"), episode: integer("Numéro d’épisode pour identifier les fichiers", 1),
   tracks: { type: "object", additionalProperties: { type: "string" }, description: "Association piste → URL directe, ou piste → fichier si service est renseigné." },
-  files: { type: "array", items: attachment, minItems: 2, maxItems: 8, description: "Pièces jointes audio dans l’ordre de track_names." },
-  track_names: { type: "array", items: text("Nom de piste Auphonic"), minItems: 2, maxItems: 8,
-    description: "Nom de chaque piste, dans le même ordre que files." },
+  files: attachments, track_names: trackNames,
   skip_tracks: { type: "array", items: { type: "string" } }, title: titleField,
   basename: text("Nom de base des fichiers de sortie"), action: actionField, dry_run: { type: "boolean" },
 }, [], write, async (args, env) => {
@@ -202,7 +308,9 @@ tool("start_multitrack_production", "Prépare ou démarre une production multipi
   const preset = presetFor(args, env);
   if (args.files) return await uploadMultitrack(env, args, preset, mode);
   if (args.track_names) throw new UploadInputError("Fournissez les pièces jointes dans files avec track_names.");
+  if (args.tracks && args.episode !== undefined) throw new UploadInputError("Fournissez tracks ou episode, selon la source choisie.");
   const config = await api(env, "/preset/" + preset + ".json");
+  if (config?.is_multitrack === false) throw new UploadInputError("Sélectionnez un préréglage multipiste.");
   const existing = (config?.multi_input_files ?? []).filter((track) => track.type === "multitrack" && track.id);
   const byId = new Map(existing.map((track) => [track.id.toLowerCase(), track]));
   const show = args.show?.trim().toUpperCase().replaceAll("-", "_") ??
@@ -215,7 +323,8 @@ tool("start_multitrack_production", "Prépare ou démarre une production multipi
     ? await inferTracks(env, service, args.episode, names)
     : Object.entries(args.tracks);
   const entries = candidates.map(([name, file]) => [name.trim(), file]).filter(([name]) => !skip.has(name.toLowerCase()));
-  if (!entries.length || entries.some(([name, file]) => !name || typeof file !== "string" || !file.trim())) throw Error("Indiquez au moins une piste avec un nom et un fichier.");
+  if (!entries.length || entries.some(([name, file]) => !name || typeof file !== "string" || !file.trim())) throw new UploadInputError("Indiquez au moins une piste avec un nom et un fichier.");
+  entries.forEach(([name]) => trackName(name));
   const ids = new Set(entries.map(([name]) => name.toLowerCase()));
   if (ids.size !== entries.length) throw Error("Les noms de pistes doivent être uniques.");
   if (new Set(entries.map(([, file]) => file)).size !== entries.length) throw Error("Chaque piste doit utiliser un fichier distinct.");
@@ -230,12 +339,13 @@ tool("start_multitrack_production", "Prépare ou démarre une production multipi
     else append.push({ ...input, algorithms: template });
   }
   const drop = existing.filter((track) => !ids.has(track.id.toLowerCase())).map((track) => track.id);
-  const create = { preset, metadata: args.title ? { title: args.title } : undefined, output_basename: args.basename };
+  const create = { preset, is_multitrack: true, metadata: args.title ? { title: args.title } : undefined, output_basename: args.basename };
   if (preview(args.dry_run)) {
     return {
       dry_run: true, create, drop, start: mode === "start",
-      fill: keep.map(({ id, service, input_file }) => ({ id, service, input_file: service ? input_file : new URL(input_file).origin })),
-      append: append.map(({ id, service, input_file }) => ({ id, service, input_file: service ? input_file : new URL(input_file).origin })),
+      fill: keep.map((track) => ({ ...trackDetails(track), input_file: fileLabel(track.input_file), algorithms: byId.get(track.id.toLowerCase())?.algorithms })),
+      append: append.map((track) => ({ ...trackDetails(track), input_file: fileLabel(track.input_file) })),
+      preset_settings: presetDetails(config, preset),
     };
   }
   const created = await api(env, "/productions.json", { method: "POST", body: create });
@@ -258,16 +368,73 @@ tool("start_multitrack_production", "Prépare ou démarre une production multipi
       throw Error("Les pistes enregistrées diffèrent des pistes attendues.");
     }
     if (mode === "start") return await tools.start_production.run({ production_uuid: id }, env);
-    return productionDetails(saved, id);
+    return productionDetails(saved, id, env);
   } catch (error) {
-    throw Error(error.message + " Production " + id + " créée. Vérifiez son état sur Auphonic avant de réessayer.");
+    throw await draftError(error, env, id);
   }
 });
 
 tools.start_multitrack_production._meta = { "openai/fileParams": ["files"] };
 
+tool("create_multitrack_from_files", "Crée un brouillon multipiste à partir de pièces jointes ChatGPT. Fournissez preset ou show et associez chaque fichier à son nom de piste par position. Les pistes fournies remplacent les pistes multipistes du préréglage. dry_run affiche le plan.", {
+  ...presetFields, files: attachments, track_names: trackNames, title: titleField,
+  basename: text("Nom de base des fichiers de sortie"), dry_run: { type: "boolean" },
+}, ["files", "track_names"], write, async (args, env) => uploadMultitrack(env, args, presetFor(args, env), "save"));
+tools.create_multitrack_from_files._meta = { "openai/fileParams": ["files"] };
+
+tool("create_production", "Crée un brouillon vide. Fournissez preset ou show. Avec track_names, ces noms remplacent les pistes multipistes du preset. Ajoutez ensuite les fichiers avec upload_production_file, puis vérifiez le brouillon avant de le démarrer.", {
+  ...presetFields, track_names: trackNames, title: titleField, basename: text("Nom de base des fichiers de sortie"),
+}, [], write, async (args, env) => {
+  const preset = presetFor(args, env);
+  if (args.track_names) {
+    const plan = await planUploadDraft(env, { ...args, preset, names: args.track_names });
+    return createUploadDraft(env, plan);
+  }
+  return productionDetails(await api(env, "/productions.json", { method: "POST", body: {
+    preset, metadata: args.title ? { title: args.title } : undefined, output_basename: args.basename,
+  } }), undefined, env);
+});
+
+tool("update_production", "Modifie le titre, le sous-titre, le résumé ou le nom de base des sorties d’une production existante. Fournissez au moins un champ à modifier.", {
+  production_uuid: productionId, title: titleField, subtitle: text("Sous-titre"), summary: text("Résumé"),
+  basename: text("Nom de base des fichiers de sortie"),
+}, ["production_uuid"], write, async ({ production_uuid, title, subtitle, summary, basename }, env) => {
+  if ([title, subtitle, summary, basename].every((value) => value === undefined)) throw new UploadInputError("Fournissez au moins un champ à modifier.");
+  const path = productionPath(production_uuid) + ".json";
+  const current = await api(env, path);
+  if (current.change_allowed === false) throw new ToolError("PRODUCTION_NOT_EDITABLE", "Cette production ne peut pas être modifiée.", { production_uuid });
+  return productionDetails(await api(env, path, { method: "POST", body: {
+    metadata: title !== undefined || subtitle !== undefined || summary !== undefined ? { title, subtitle, summary } : undefined,
+    output_basename: basename,
+  } }), production_uuid, env);
+});
+
+tool("upload_production_file", "Envoie ou remplace une pièce jointe dans un brouillon Auphonic existant. En multipiste, indiquez le nom de la piste renvoyé par check_status. En mono, omettez track.", {
+  production_uuid: productionId, file: attachment, track: text("Nom d’une piste multipiste existante"),
+}, ["production_uuid", "file"], { ...write, destructiveHint: true }, async ({ production_uuid, file, track }, env) => {
+  const path = productionPath(production_uuid);
+  const draft = await api(env, path + ".json");
+  const field = draftUploadField(draft, track);
+  try {
+    const source = await openAttachment(file);
+    try {
+      await sendAudio(env, path + "/upload.json", {}, [[field, source]]);
+    } finally {
+      await source.body.cancel().catch(() => {});
+    }
+    const saved = await api(env, path + ".json");
+    if (!(draft.is_multitrack ? saved?.multi_input_files?.some((input) => input.id === field && input.input_file) : saved?.input_file)) {
+      throw new ToolError("UPLOAD_UNCONFIRMED", "Auphonic n’a pas confirmé le fichier d’entrée.");
+    }
+    return { ...productionDetails(saved, production_uuid, env), uploaded_file: { track: track && field, file: source.name } };
+  } catch (error) {
+    throw await draftError(error, env, production_uuid);
+  }
+});
+tools.upload_production_file._meta = { "openai/fileParams": ["file"] };
+
 const prompts = {
-  upload_and_process: { description: "Préparer un fichier audio pour Auphonic", message: "Sélectionne un préréglage, demande une URL audio directe et prépare un brouillon avec upload_audio." },
+  upload_and_process: { description: "Préparer un fichier audio pour Auphonic", message: "Consulte les préréglages et leurs réglages. Prépare un brouillon avec upload_audio, ou create_multitrack_from_files pour plusieurs pièces jointes." },
   analyze_production: { description: "Consulter une production", message: "Demande l’UUID de la production si nécessaire, puis consulte son statut avec check_status." },
   check_recent_uploads: { description: "Consulter les productions récentes", message: "Consulte les dernières productions avec list_productions et résume leur état." },
 };
@@ -286,19 +453,19 @@ function validateArgument(name, value, schema) {
     : type === "integer" ? Number.isSafeInteger(value)
     : typeof value === type;
   if (!valid || (schema.enum && !schema.enum.includes(value)) || value < schema.minimum || value > schema.maximum) {
-    throw Error("Argument invalide : " + name);
+    throw new ToolError("INVALID_ARGUMENT", "Argument invalide : " + name);
   }
   if (type === "array") {
-    if (value.length < schema.minItems || value.length > schema.maxItems) throw Error("Nombre d’éléments invalide : " + name);
+    if (value.length < schema.minItems || value.length > schema.maxItems) throw new ToolError("INVALID_ARGUMENT", "Nombre d’éléments invalide : " + name);
     value.forEach((item) => validateArgument(name, item, schema.items));
   }
   if (type !== "object") return;
   for (const field of schema.required ?? []) {
-    if (!Object.hasOwn(value, field)) throw Error("Argument requis : " + field);
+    if (!Object.hasOwn(value, field)) throw new ToolError("INVALID_ARGUMENT", "Argument requis : " + field);
   }
   for (const [key, item] of Object.entries(value)) {
     const property = Object.hasOwn(schema.properties ?? {}, key) ? schema.properties[key] : schema.additionalProperties;
-    if (property === false) throw Error("Argument inconnu : " + key);
+    if (property === false) throw new ToolError("INVALID_ARGUMENT", "Argument inconnu : " + key);
     if (property) validateArgument(key, item, property);
   }
 }
@@ -323,10 +490,15 @@ async function mcp(request, env) {
       const args = params?.arguments ?? {};
       try {
         validateArgument("arguments", args, selected.inputSchema);
-        const result = await selected.run(args, env);
-        return ok({ content: [{ type: "text", text: JSON.stringify(result, null, 2) }] });
+        const result = await selected.run(args, env, new URL(request.url).origin);
+        return ok({ structuredContent: Array.isArray(result) ? { items: result } : result,
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }] });
       } catch (error) {
-        return ok({ isError: true, content: [{ type: "text", text: error.message }] });
+        const message = publicMessage(error.message, env);
+        const { retryable = false, upstream_status, ...details } = error.details ?? {};
+        return ok({ isError: true, structuredContent: { ...details, retryable,
+          error: { code: error.code ?? "TOOL_ERROR", message, upstream_status } },
+          content: [{ type: "text", text: message }] });
       }
     }
     case "resources/list": return ok({ resources });
@@ -361,9 +533,9 @@ const attachmentLimit = 2 * 1024 * 1024 * 1024;
 const fileTypes = /\.(?:wav|bwf|rf64|w64|flac|mp[234]|m4[abv]|ogg|oga|opus|aac|aiff?|aifc|caf|wma|webm|mov|mkv|mpeg|mpg|avi|ac3|alac|mxf)$/i;
 const encode = new TextEncoder();
 
-class UploadInputError extends Error {
-  constructor(message, status = 400) {
-    super(message);
+class UploadInputError extends ToolError {
+  constructor(message, status = 400, code = "INVALID_ARGUMENT") {
+    super(code, message);
     this.status = status;
   }
 }
@@ -393,19 +565,24 @@ function resolveAttachment(file) {
   if (url.protocol !== "https:" || !allowed || url.username || url.password || url.port) {
     throw new UploadInputError("Utilisez une pièce jointe ChatGPT ou le champ input_url pour une URL externe.");
   }
-  return { url, name: audioName(file.file_name, file.mime_type) };
+  const name = file.file_name ? audioName(file.file_name) : undefined;
+  return { url, name, mime: file.mime_type, label: name ?? file.file_id };
 }
 
 function openAttachment(file) {
   return downloadAttachment(resolveAttachment(file));
 }
 
-async function downloadAttachment({ url, name }) {
-  const response = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(5 * 60 * 1000) });
+async function downloadAttachment({ url, name, mime }) {
+  const inaccessible = () => new UploadInputError("Pièce jointe inaccessible. Joignez-la de nouveau ou utilisez le formulaire du site.", 400, "ATTACHMENT_UNAVAILABLE");
+  const response = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(5 * 60 * 1000) }).catch(() => { throw inaccessible(); });
   try {
-    if (!response.ok || !response.body) throw new UploadInputError("Pièce jointe inaccessible. Joignez-la de nouveau ou utilisez le formulaire du site.");
+    if (!response.ok || !response.body) throw inaccessible();
     const size = audioSize(response.headers.get("content-length"), attachmentLimit);
-    return { name, size, body: response.body };
+    const disposition = response.headers.get("content-disposition") ?? "";
+    const headerName = /;\s*filename=(?:"([^"]+)"|([^;]+))/i.exec(disposition);
+    const media = response.headers.get("content-type")?.split(";")[0];
+    return { name: name ?? audioName(headerName?.[1] ?? headerName?.[2], mime || media), size, body: response.body };
   } catch (error) {
     await response.body?.cancel().catch(() => {});
     throw error;
@@ -461,12 +638,46 @@ async function uploadSingle(env, { preset, title, subtitle, summary, type, mode 
   const data = await sendAudio(env, "/simple/productions.json", {
     preset, title, subtitle, summary, tags: type, action: mode,
   }, [["input_file", source]]);
-  return productionDetails(data, uuid(data?.uuid, "UUID de la production créée"));
+  return productionDetails(data, uuid(data?.uuid, "UUID de la production créée"), env);
 }
 
 const maxTracks = 8;
 // Auphonic may report an empty, incomplete, uploading, or saved draft.
 const uploadableStatuses = new Set([0, 9, 10, 98]);
+function hasRequiredInputs(data) {
+  if (!data?.is_multitrack) return Boolean(data?.input_file);
+  const tracks = (data.multi_input_files ?? []).filter((track) => track.type === "multitrack");
+  return tracks.length > 0 && tracks.every((track) => track.input_file);
+}
+
+function draftUploadField(data, track) {
+  if (data?.change_allowed === false || !uploadableStatuses.has(data?.status)) {
+    throw new ToolError("PRODUCTION_NOT_EDITABLE", "L’upload est réservé aux brouillons modifiables.", { next_action: "check_status" });
+  }
+  if (!data.is_multitrack) {
+    if (track !== undefined) throw new UploadInputError("Omettez track pour une production mono.");
+    return "input_file";
+  }
+  const name = trackName(track);
+  const input = data.multi_input_files?.find((input) => input.type === "multitrack" && input.id?.toLowerCase() === name.toLowerCase());
+  if (!input) throw new ToolError("TRACK_NOT_FOUND", "Piste introuvable dans le brouillon.", { next_action: "check_status" });
+  return input.id;
+}
+
+async function draftError(error, env, id, expected = []) {
+  const data = await api(env, productionPath(id) + ".json").catch(() => null);
+  const details = data ? productionDetails(data, id, env) : undefined;
+  const inputs = (details?.tracks ?? []).filter((track) => track.type === "multitrack");
+  const expectedNames = expected.length ? expected : inputs.map((track) => track.id);
+  const missing = data ? expectedNames.filter((name) => !inputs.some((track) => track.id === name && track.has_input)) : undefined;
+  const next = inputs.some((track) => missing?.includes(track.id)) || (data?.is_multitrack === false && !data.input_file)
+    ? "upload_production_file" : "check_status";
+  return new ToolError(error.code ?? "PRODUCTION_INCOMPLETE",
+    "Brouillon " + id + ". " + publicMessage(error.message, env) + " Vérifiez son état avant de répéter une écriture.", {
+      ...error.details, retryable: false, production_uuid: id, production: details, missing_tracks: missing, next_action: next,
+    });
+}
+
 function trackName(value) {
   const name = typeof value === "string" ? value.trim() : "";
   if (!name || name.length > 100 || /[\x00-\x1f\x7f"\\]/.test(name)) {
@@ -494,7 +705,9 @@ async function planUploadDraft(env, { preset, title, basename, names }) {
   const drop = existing.filter((track) => !wanted.has(track.id)).map((track) => track.id);
   const body = { preset, is_multitrack: true, metadata: title ? { title } : undefined, output_basename: basename };
   if (!existing.length) body.multi_input_files = append;
-  return { body, tracks, drop, append: existing.length ? append : [] };
+  const newTracks = new Map(append.map((track) => [track.id, track]));
+  return { body, tracks, drop, append: existing.length ? append : [], preset: presetDetails(config, preset),
+    track_settings: tracks.map((id) => trackDetails(byId.get(id.toLowerCase()) ?? newTracks.get(id))) };
 }
 
 function uploadedTracks(production, expected, requireFiles = false) {
@@ -520,14 +733,14 @@ async function createUploadDraft(env, plan) {
     if (!uploadedTracks(saved, tracks)) {
       throw Error("Auphonic a enregistré une liste de pistes différente.");
     }
-    return { ...productionDetails(saved, id), upload_tracks: tracks };
+    return { ...productionDetails(saved, id, env), upload_tracks: tracks };
   } catch (error) {
-    throw Error(error.message + " Le brouillon " + id + " a été créé. Vérifiez-le sur Auphonic avant de réessayer.");
+    throw await draftError(error, env, id, tracks);
   }
 }
 
 async function uploadMultitrack(env, args, preset, mode) {
-  if (args.tracks || args.service || args.episode) {
+  if (args.tracks !== undefined || args.service !== undefined || args.episode !== undefined) {
     throw new UploadInputError("Utilisez files et track_names ensemble pour un téléversement local.");
   }
   if (args.files.length !== args.track_names?.length) {
@@ -541,8 +754,11 @@ async function uploadMultitrack(env, args, preset, mode) {
     throw new UploadInputError("Chaque piste doit utiliser une pièce jointe distincte.");
   }
   const plan = await planUploadDraft(env, { preset, title: args.title, basename: args.basename, names: entries.map(([name]) => name) });
-  const mapping = plan.tracks.map((track, i) => ({ track, file: files[i].name }));
-  if (preview(args.dry_run)) return { dry_run: true, preset, tracks: mapping, start: mode === "start" };
+  const mapping = plan.tracks.map((track, i) => ({ track, file: files[i].label }));
+  if (preview(args.dry_run)) return {
+    dry_run: true, preset, tracks: mapping, drop: plan.drop, track_settings: plan.track_settings,
+    preset_settings: plan.preset, start: mode === "start",
+  };
 
   const draft = await createUploadDraft(env, plan);
   const path = productionPath(draft.uuid);
@@ -553,7 +769,10 @@ async function uploadMultitrack(env, args, preset, mode) {
       const sources = [];
       try {
         for (const file of files.slice(index, index + 2)) {
-          sources.push([plan.tracks[index + sources.length], await downloadAttachment(file)]);
+          const position = index + sources.length;
+          const source = await downloadAttachment(file);
+          sources.push([plan.tracks[position], source]);
+          mapping[position].file = source.name;
         }
         await sendAudio(env, path + "/upload.json", {}, sources);
       } finally {
@@ -562,10 +781,10 @@ async function uploadMultitrack(env, args, preset, mode) {
     }
     const saved = await api(env, path + ".json");
     if (!uploadedTracks(saved, plan.tracks, true)) throw Error("Auphonic n’a pas confirmé le fichier de chaque piste.");
-    if (mode === "start") return await tools.start_production.run({ production_uuid: draft.uuid }, env);
-    return { ...productionDetails(saved, draft.uuid), uploaded_files: mapping };
+    const result = mode === "start" ? await tools.start_production.run({ production_uuid: draft.uuid }, env) : productionDetails(saved, draft.uuid, env);
+    return { ...result, uploaded_files: mapping };
   } catch (error) {
-    throw Error(error.message + " Vérifiez la production " + draft.uuid + " sur Auphonic avant de réessayer.");
+    throw await draftError(error, env, draft.uuid, plan.tracks);
   }
 }
 
@@ -619,11 +838,65 @@ async function uploadRoute(request, url, env) {
 
 const uploadPaths = new Set(["/api/upload/presets", "/api/upload/draft", "/api/upload/single", "/api/upload/track"]);
 
+function resultFileUrl(data, id, filename) {
+  if (!filename) return null;
+  const file = data?.output_files?.find((file) => file.filename === filename && file.download_url);
+  if (!file) return null;
+  try {
+    const url = new URL(file.download_url);
+    if (url.origin === "https://auphonic.com" && !url.username && !url.password &&
+      url.pathname.startsWith("/api/download/audio-result/" + id + "/")) return url;
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+async function downloadRoute(request, url, env) {
+  const headers = { "Cache-Control": "private, no-store", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff" };
+  if (request.method !== "GET") return new Response(null, { status: 405, headers: { ...headers, Allow: "GET" } });
+  if (!request.headers.get("oai-authenticated-user-id")) return new Response("Connectez-vous au site.", { status: 401, headers });
+  const id = url.searchParams.get("production");
+  const filename = url.searchParams.get("filename");
+  if (!id || !/^[a-zA-Z0-9_-]{1,80}$/.test(id) || !filename) return new Response("Sélection de fichier invalide.", { status: 400, headers });
+  try {
+    const data = await api(env, productionPath(id) + ".json");
+    const upstream = data?.status === 3 ? resultFileUrl(data, id, filename) : null;
+    if (!upstream) return new Response("Fichier indisponible.", { status: 404, headers });
+    const key = env.AUPHONIC_API_KEY.trim();
+    upstream.searchParams.set("bearer_token", key);
+    let target = upstream;
+    const signal = AbortSignal.timeout(5 * 60 * 1000);
+    for (let redirect = 0; redirect < 5; redirect++) {
+      const audio = await fetch(target, { redirect: "manual", signal });
+      if (audio.ok && audio.body) {
+        const encodedName = encodeURIComponent(filename).replace(/['()*]/g, (char) => "%" + char.charCodeAt(0).toString(16));
+        const length = audio.headers.get("Content-Length");
+        return new Response(audio.body, { headers: {
+          ...headers, "Content-Type": "application/octet-stream",
+          "Content-Disposition": "attachment; filename*=UTF-8''" + encodedName,
+          ...(length ? { "Content-Length": length } : {}),
+        } });
+      }
+      await audio.body?.cancel().catch(() => {});
+      const location = audio.headers.get("Location");
+      if (![301, 302, 303, 307, 308].includes(audio.status) || !location) break;
+      target = new URL(location, target);
+      if (target.protocol !== "https:" || target.username || target.password || target.port) break;
+      if (target.origin !== upstream.origin && decodeURIComponent(target.href).includes(key)) break;
+    }
+  } catch (error) {
+    if (error.code === "NOT_FOUND") return new Response("Fichier indisponible.", { status: 404, headers });
+  }
+  return new Response("Auphonic n’a pas pu fournir le fichier.", { status: 502, headers });
+}
+
 export default {
   fetch(request, env) {
     const url = new URL(request.url);
     const { pathname } = url;
     if (pathname === "/mcp") return mcp(request, env);
+    if (pathname === "/api/output") return downloadRoute(request, url, env);
     if (pathname === "/health") return Response.json({ status: "ok", auphonic_configured: Boolean(env.AUPHONIC_API_KEY?.trim()) });
     if (uploadPaths.has(pathname)) return uploadRoute(request, url, env);
     if (pathname !== "/") return new Response("Introuvable", { status: 404 });

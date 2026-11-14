@@ -4,7 +4,7 @@ Portage JavaScript de [JupiterBroadcasting/auphonic-mcp](https://github.com/Jupi
 
 Le Worker fournit `POST /mcp` et `GET /health`. L’accès est contrôlé par Sites. Configurez `AUPHONIC_API_KEY` comme secret d’exécution. Les UUID de préréglage peuvent être passés directement ou associés à une émission via `AUPHONIC_PRESET_MON_PODCAST`. Pour retrouver automatiquement les pistes d’un épisode quand le préréglage n’en déclare aucune, définissez `AUPHONIC_TRACKS_MON_PODCAST` avec les noms des pistes séparés par des virgules.
 
-Les fichiers d’entrée proviennent d’URL directes ou de services externes associés à Auphonic. Les outils de création enregistrent un brouillon par défaut. `action: "start"` ou `start_production` lance le traitement. `download_output` indique les sorties disponibles et renvoie vers la page de la production pour le téléchargement.
+Les fichiers d’entrée proviennent de pièces jointes, d’URL directes ou de services externes associés à Auphonic. Les outils de création enregistrent un brouillon par défaut. `action: "start"` ou `start_production` lance le traitement, qui peut consommer des crédits et publier vers les destinations configurées.
 
 ## Compiler et déployer
 
@@ -20,6 +20,15 @@ Le champ `file` de `upload_audio` accepte une pièce jointe ChatGPT si le client
 
 ### Multipiste depuis le MCP
 
-Joindre les enregistrements à la conversation, puis appeler `start_multitrack_production` avec les pièces jointes dans `files` et les noms correspondants dans `track_names`. Par exemple, pour `hote.wav` puis `invite.wav`, utiliser `track_names: ["Hôte", "Invité"]`. Le client MCP doit prendre en charge les paramètres de fichier. Un chemin local seul ne transmet pas le fichier au serveur.
+Joindre deux à huit enregistrements à la conversation, puis appeler `create_multitrack_from_files` avec les pièces jointes dans `files` et les noms correspondants dans `track_names`. Par exemple, pour `hote.wav` puis `invite.wav`, utiliser `track_names: ["Hôte", "Invité"]`. Le client MCP doit prendre en charge les paramètres de fichier. Un chemin local seul ne transmet pas le fichier au serveur. Le serveur accepte jusqu’à 2048 Mio par pièce jointe, sous réserve des limites du client.
 
-Le Worker crée un seul brouillon Auphonic et envoie les enregistrements en multipart, chacun dans le champ portant le nom de sa piste. `dry_run: true` affiche la correspondance et `action: "start"` lance le traitement après vérification des pistes. Par défaut, le brouillon reste disponible pour vérification manuelle.
+Le Worker crée un seul brouillon Auphonic et envoie les enregistrements en multipart, chacun dans le champ portant le nom de sa piste. Les pistes fournies remplacent la liste des pistes multipistes du préréglage. `dry_run: true` affiche l’association piste–fichier, les suppressions et les réglages hérités. `start_multitrack_production` reste disponible pour les URL, les services Auphonic et les clients qui utilisaient déjà son contrat.
+
+### Parcours des outils
+
+1. `list_presets` puis `get_preset` pour connaître les pistes, les traitements, les sorties et les destinations. `list_services` et `list_service_files` permettent d’explorer les sources externes.
+2. `create_production` pour préparer un brouillon et ses pistes. `upload_production_file` ajoute ou remplace le fichier d’une piste sur le même UUID. `update_production` modifie les métadonnées et le nom de base des sorties.
+3. `check_status` rend compte des fichiers associés, des avertissements et de la possibilité de démarrer. En cas d’erreur partielle, la réponse inclut l’UUID et les pistes manquantes lorsque leur état peut être relu.
+4. `start_production` lance le traitement. `list_outputs` indique les fichiers disponibles et `download_output` permet de sélectionner un nom exact. Le lien télécharge le fichier depuis le site privé après connexion.
+
+Les résultats MCP contiennent un objet `structuredContent` en plus du texte. Les listes y sont sous `items`. Les erreurs exposent un code et, selon le cas, l’UUID de production et l’action suivante.

@@ -1,4 +1,4 @@
-const serverInfo = { name: "auphonic-mcp", version: "1.4.0" };
+const serverInfo = { name: "auphonic-mcp", version: "1.4.1" };
 const version = "2026-07-28";
 const capabilities = { tools: {}, resources: {}, prompts: {} };
 const text = (description) => ({ type: "string", description });
@@ -116,6 +116,9 @@ function processingDetails(data) {
     speech_recognition: speech && Object.keys(speech).length ? { ...pickFields(speech, speechFields), type: speech.type } : null,
     review_before_publishing: data?.review_before_publishing,
     in_review: data?.in_review,
+    publication_review_status: Array.isArray(data?.outgoing_services)
+      ? !data.outgoing_services.length ? "no_destination" : publicationReviewEnabled(data) ? "enabled" : "disabled"
+      : undefined,
     outputs: outputDetails(data?.output_files),
     destinations: destinations(data),
   };
@@ -228,14 +231,20 @@ tool("download_output", "Renvoie les liens de téléchargement depuis le site pr
   return { ...result, files };
 });
 
-tool("start_production", "Démarre le traitement d’un brouillon complet. Peut consommer des crédits et publier vers les destinations configurées.", {
+tool("start_production", "Démarre le traitement d’un brouillon complet. Si des destinations existent, vérifie la validation avant publication. Ne passez allow_automatic_publication à true que pour autoriser explicitement la publication sans validation.", {
   production_uuid: productionId,
-}, ["production_uuid"], write, async ({ production_uuid }, env) => {
+  allow_automatic_publication: { type: "boolean", description: "Autoriser l’envoi automatique vers les destinations même si la validation est désactivée." },
+}, ["production_uuid"], write, async ({ production_uuid, allow_automatic_publication }, env) => {
   const path = productionPath(production_uuid);
   const draft = await api(env, path + ".json");
   if (draft?.start_allowed === false || (uploadableStatuses.has(draft?.status) && !hasRequiredInputs(draft))) {
     throw new ToolError("PRODUCTION_NOT_READY", "Auphonic ne permet pas de démarrer cette production ou des fichiers d’entrée manquent.", {
       production_uuid, next_action: "check_status",
+    });
+  }
+  if (draft?.outgoing_services?.length && !allow_automatic_publication && !publicationReviewEnabled(draft)) {
+    throw new ToolError("PUBLICATION_REVIEW_REQUIRED", "Vérifiez la validation avant publication avec update_production avant de démarrer.", {
+      production_uuid, next_action: "update_production", production: productionDetails(draft, production_uuid, env),
     });
   }
   return productionDetails(await api(env, path + "/start.json", { method: "POST" }), production_uuid, env);
@@ -279,9 +288,9 @@ tool("upload_audio", "Crée une production à partir d’une pièce jointe ChatG
   const metadata = { title: args.title, subtitle: args.subtitle, summary: args.summary, tags: args.type ? [args.type] : undefined };
   const body = {
     preset, service, input_file: fromService ? args.input_file : remoteUrl(args.input_url), metadata,
-    action: mode === "start" ? mode : undefined,
   };
-  return productionDetails(await api(env, "/productions.json", { method: "POST", body }), undefined, env);
+  const draft = await api(env, "/productions.json", { method: "POST", body });
+  return finishNewSingleDraft(draft, mode, env);
 });
 
 tools.upload_audio._meta = { "openai/fileParams": ["file"] };
@@ -421,6 +430,11 @@ const trackAlgorithmFields = {
 };
 const masterAlgorithmFields = {
   leveler: bool("Activer le nivellement"), loudnesstarget: number("Cible de sonie en LUFS"),
+  levelermode: { type: "string", enum: ["standard", "default", "broadcast", "musicspeech"],
+    description: "Mode demandé. standard correspond à default dans Auphonic. Le MCP vérifie le mode effectivement renvoyé." },
+  maxlra: integer("Limite MaxLRA du mode Broadcast en LU. 0 signifie Auto."),
+  maxs: integer("Limite MaxS du mode Broadcast en LU. 0 signifie Auto."),
+  maxm: integer("Limite MaxM du mode Broadcast en LU. 0 signifie Auto."),
   maxpeak: number("Limite de crête en dBTP"), gate: bool("Activer le noise gate multipiste"),
   crossgate: bool("Réduire les reprises de voix entre micros"), sync_tracks: bool("Synchroniser les pistes"),
   silence_cutter: bool("Couper les silences"), filler_cutter: bool("Couper les hésitations"),
@@ -467,6 +481,34 @@ function algorithmPatch(algorithms) {
   return settings;
 }
 
+const broadcastParameters = ["maxlra", "maxs", "maxm"];
+
+function publicationReviewEnabled(production) {
+  return production?.review_before_publishing === true && production.in_review !== false;
+}
+
+function requestedLevelerMode(algorithms) {
+  return algorithms?.levelermode === "standard" ? "default" : algorithms?.levelermode;
+}
+
+function masterAlgorithmPatch(algorithms, current) {
+  const settings = algorithmPatch(algorithms);
+  const mode = requestedLevelerMode(algorithms);
+  if (!mode) return settings;
+  if (mode === "musicspeech" && current.is_multitrack) {
+    throw new UploadInputError("Le mode Music/Speech du master est réservé aux productions mono.");
+  }
+  if (mode !== "broadcast" && broadcastParameters.some((key) => Object.hasOwn(settings, key))) {
+    throw new UploadInputError("MaxLRA, MaxS et MaxM sont des paramètres Broadcast, même à 0 (Auto).");
+  }
+  if (mode === "broadcast") {
+    for (const key of broadcastParameters) settings[key] ??= current.algorithms?.[key] ?? 0;
+  }
+  // Auphonic derives Broadcast from the presence of its tuning parameters.
+  // Send the requested mode on the production update and verify it on readback.
+  return { ...settings, leveler: settings.leveler ?? true, levelermode: mode };
+}
+
 function matchesSetting(actual, wanted) {
   if (Array.isArray(wanted)) return Array.isArray(actual) && wanted.length === actual.length &&
     wanted.every((value, index) => matchesSetting(actual[index], value));
@@ -477,11 +519,14 @@ function matchesSetting(actual, wanted) {
 
 function verifyProductionChanges(args, saved) {
   const mismatches = [];
+  const mode = requestedLevelerMode(args.algorithms);
+  const noReviewDestination = args.review_before_publishing === true && !saved?.outgoing_services?.length;
   for (const field of ["title", "subtitle", "summary"]) {
     if (args[field] !== undefined && args[field] !== saved?.metadata?.[field]) mismatches.push(field);
   }
   if (args.basename !== undefined && args.basename !== saved?.output_basename) mismatches.push("basename");
   if (args.algorithms && !matchesSetting(saved?.algorithms, algorithmPatch(args.algorithms))) mismatches.push("algorithms");
+  if (mode && saved?.algorithms?.levelermode !== mode) mismatches.push("algorithms.levelermode");
   for (const track of args.multi_input_files ?? []) {
     const actual = saved?.multi_input_files?.find((input) => input.type === "multitrack" && input.id === track.id);
     if (!actual || (track.algorithms && !matchesSetting(actual.algorithms, algorithmPatch(track.algorithms))) ||
@@ -494,7 +539,8 @@ function verifyProductionChanges(args, saved) {
     if (!matchesSetting(actual, args.speech_recognition) ||
       (args.speech_recognition.uuid === undefined && actual?.type !== "whisper")) mismatches.push("speech_recognition");
   }
-  if (args.review_before_publishing !== undefined && saved?.review_before_publishing !== args.review_before_publishing) {
+  if (!noReviewDestination && args.review_before_publishing !== undefined &&
+    (args.review_before_publishing ? !publicationReviewEnabled(saved) : saved?.review_before_publishing !== false)) {
     mismatches.push("review_before_publishing");
   }
   const services = saved?.outgoing_services ?? [];
@@ -511,8 +557,16 @@ function verifyProductionChanges(args, saved) {
     }
     if (remaining.length && !mismatches.includes("output_files")) mismatches.push("output_files");
   }
-  if (mismatches.length) throw new ToolError("PRODUCTION_UPDATE_UNCONFIRMED",
-    "Auphonic n’a pas confirmé tous les réglages demandés.", { unconfirmed_fields: mismatches });
+  if (mismatches.length || noReviewDestination) {
+    const reasons = [];
+    if (mismatches.includes("algorithms.levelermode")) reasons.push("Auphonic indique toujours le mode de nivellement " + (saved?.algorithms?.levelermode ?? "inconnu") + ".");
+    if (noReviewDestination) reasons.push("La validation avant publication exige une destination de sortie.");
+    throw new ToolError(mismatches.length ? "PRODUCTION_UPDATE_UNCONFIRMED" : "REVIEW_REQUIRES_DESTINATION",
+      reasons.join(" ") || "Auphonic n’a pas confirmé tous les réglages demandés.", {
+        unconfirmed_fields: [...mismatches, ...(noReviewDestination ? ["review_before_publishing"] : [])],
+        review_requires_destination: noReviewDestination || undefined,
+      });
+  }
 }
 
 function productionChanges(args, current) {
@@ -527,9 +581,10 @@ function productionChanges(args, current) {
     throw new UploadInputError("Utilisez outgoing_services pour remplacer la liste ou remove_outgoing_services pour retirer des destinations.");
   }
   if (algorithms) {
-    const changes = algorithmPatch(algorithms);
-    if (!Object.keys(changes).length) throw new UploadInputError("Les champs cutter et levelermode sont calculés par Auphonic. Indiquez les réglages éditables.");
-    post("algorithms", "/algorithms.json", changes);
+    const changes = masterAlgorithmPatch(algorithms, current);
+    if (!Object.keys(changes).length) throw new UploadInputError("Le champ cutter est calculé par Auphonic. Indiquez les types de coupe à modifier.");
+    if (requestedLevelerMode(algorithms)) post("algorithms", ".json", { algorithms: changes });
+    else post("algorithms", "/algorithms.json", changes);
   }
 
   const trackIds = new Set();
@@ -560,11 +615,15 @@ function productionChanges(args, current) {
   }
 
   let publicationChanged = false;
+  let destinationCount = current.outgoing_services?.length ?? 0;
+  let destinationAdded = false;
   if (outgoing_services !== undefined || remove_outgoing_services !== undefined) {
     const existing = new Map((current.outgoing_services ?? []).map((service) => [service.uuid, service]));
     const removed = new Set((remove_outgoing_services ?? []).map((id) => uuid(id, "remove_outgoing_services")));
     const wanted = outgoing_services ?? [...existing.keys()].filter((id) => !removed.has(id)).map((uuid) => ({ uuid }));
     const selected = new Set(wanted.map((service) => uuid(service.uuid, "outgoing_services.uuid")));
+    destinationCount = selected.size;
+    destinationAdded = [...selected].some((id) => !existing.has(id));
     if (selected.size !== wanted.length) throw new UploadInputError("Chaque destination doit avoir un UUID distinct.");
     const replaces = [...existing.keys()].some((id) => !selected.has(id));
     if (replaces) clear("outgoing_services", "/outgoing_services.json");
@@ -584,7 +643,8 @@ function productionChanges(args, current) {
     if (output_files.length) post("output_files", "/output_files.json", output_files);
   }
 
-  const review = review_before_publishing ?? (publicationChanged ? current.review_before_publishing : undefined);
+  const review = destinationCount > 0 ? (review_before_publishing ??
+    (destinationAdded ? true : publicationChanged ? current.review_before_publishing : undefined)) : undefined;
   if ([title, subtitle, summary, basename, review].some((value) => value !== undefined)) {
     post("production_settings", ".json", {
       metadata: [title, subtitle, summary].some((value) => value !== undefined) ? { title, subtitle, summary } : undefined,
@@ -613,7 +673,7 @@ tool("update_production", "Modifie les réglages d’un brouillon sans le démar
   outgoing_services: { type: "array", items: object(serviceFields, "Configuration d’une destination de publication", ["uuid"]),
     description: "Liste finale des destinations. Omettez le champ pour les conserver et envoyez [] pour les retirer." },
   remove_outgoing_services: strings("UUID des destinations à retirer du brouillon. Conserve les autres destinations. Incompatible avec outgoing_services."),
-  review_before_publishing: bool("Exiger une validation avant la publication vers les destinations configurées"),
+  review_before_publishing: bool("Exiger une validation avant publication. Au moins une destination est requise. Une destination ajoutée active la validation par défaut."),
 }, ["production_uuid"], { ...write, destructiveHint: true }, async (args, env) => {
   const { production_uuid } = args;
   if (Object.keys(args).length < 2) throw new UploadInputError("Fournissez au moins un champ à modifier.");
@@ -632,7 +692,10 @@ tool("update_production", "Modifie les réglages d’un brouillon sans le démar
       completed.push({ name: step.name, method: step.method });
     }
     const saved = steps.length ? await api(env, path) : current;
-    verifyProductionChanges(args, saved);
+    const addedDestination = saved?.outgoing_services?.some((service) =>
+      !current.outgoing_services?.some((previous) => previous.uuid === service.uuid));
+    verifyProductionChanges(addedDestination && args.review_before_publishing === undefined
+      ? { ...args, review_before_publishing: true } : args, saved);
     return productionDetails(saved, production_uuid, env);
   } catch (error) {
     const saved = await api(env, path).catch(() => null);
@@ -875,9 +938,19 @@ function sendAudio(env, path, fields, files) {
 
 async function uploadSingle(env, { preset, title, subtitle, summary, type, mode = "save" }, source) {
   const data = await sendAudio(env, "/simple/productions.json", {
-    preset, title, subtitle, summary, tags: type, action: mode,
+    preset, title, subtitle, summary, tags: type, action: "save",
   }, [["input_file", source]]);
-  return productionDetails(data, uuid(data?.uuid, "UUID de la production créée"), env);
+  return finishNewSingleDraft(data, mode, env);
+}
+
+async function finishNewSingleDraft(data, mode, env) {
+  const production_uuid = uuid(data?.uuid, "UUID de la production créée");
+  if (mode !== "start") return productionDetails(data, production_uuid, env);
+  try {
+    return await tools.start_production.run({ production_uuid }, env);
+  } catch (error) {
+    throw await draftError(error, env, production_uuid);
+  }
 }
 
 const maxTracks = 8;
@@ -913,7 +986,8 @@ async function draftError(error, env, id, expected = []) {
     ? "upload_production_file" : "check_status";
   return new ToolError(error.code ?? "PRODUCTION_INCOMPLETE",
     "Brouillon " + id + ". " + publicMessage(error.message, env) + " Vérifiez son état avant de répéter une écriture.", {
-      ...error.details, retryable: false, production_uuid: id, production: details, missing_tracks: missing, next_action: next,
+      ...error.details, retryable: false, production_uuid: id, production: details, missing_tracks: missing,
+      next_action: error.details?.next_action ?? next,
     });
 }
 

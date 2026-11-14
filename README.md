@@ -33,6 +33,8 @@ Le Worker crée un seul brouillon Auphonic et envoie les enregistrements en mult
 
 Les résultats MCP contiennent un objet `structuredContent` en plus du texte. Les listes y sont sous `items`. Les erreurs exposent un code et, selon le cas, l’UUID de production et l’action suivante.
 
+`list_productions` fetches one page, then applies the optional `status` filter. `limit` and `offset` refer to all productions. Use `next_offset` to continue, even when `items` is empty; `null` means there are no more pages. Use `check_status` with a production UUID to inspect tracks, transcription and destinations, which the list does not load.
+
 ### Régler un brouillon avant traitement
 
 `check_status` affiche les algorithmes du master et des pistes, les débits et formats de sortie, le moteur et la langue de transcription, les destinations et les champs `review_before_publishing` et `in_review` tels que les renvoie Auphonic.
@@ -55,6 +57,6 @@ Exemple d’arguments, avec les UUID et le nom de piste renvoyés par `check_sta
 
 Certaines modifications prennent plusieurs appels à Auphonic. En cas d’échec, l’outil indique les étapes terminées et le dernier état qu’il a pu relire. Vérifiez cet état avant de recommencer.
 
-Pour demander le nivellement Standard, utilisez `algorithms: { "levelermode": "standard" }` sans fournir `maxlra`, `maxs` ni `maxm`. Ces valeurs sélectionnent les réglages Broadcast, y compris à 0 (Auto). Le MCP vérifie le `levelermode` renvoyé par Auphonic. Si Auphonic conserve Broadcast sur le brouillon existant, sélectionnez le mode Standard dans l’éditeur Auphonic et vérifiez avec `check_status`.
+To switch an existing Broadcast draft to Standard, use the Auphonic editor, then verify with `check_status`: Standard appears as `algorithms.levelermode: "default"`. Auphonic's API retains Broadcast when its parameters are omitted or set to 0 (Auto). If you pass `algorithms: { "levelermode": "standard" }` for a Broadcast draft, `update_production` returns `LEVELER_MODE_UNSUPPORTED` before applying any changes. On other drafts, the MCP translates the selector into writable settings and checks the saved mode.
 
 La validation avant publication s’applique lorsqu’une destination est configurée. `check_status` distingue l’absence de destination de la validation désactivée. `update_production` demande et vérifie la validation par défaut lors d’un ajout de destination. Si un brouillon a des destinations et que la validation est inactive, `start_production` bloque le démarrage, sauf autorisation explicite avec `allow_automatic_publication: true`.

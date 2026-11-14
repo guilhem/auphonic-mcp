@@ -124,12 +124,18 @@ function processingDetails(data) {
   };
 }
 
-function productionDetails(data, fallback, env = {}) {
+function productionSummary(data, fallback) {
   const id = data?.uuid ?? fallback;
   return {
     uuid: id, url: id ? productionUrl(id) : undefined, title: data?.metadata?.title,
     status: data?.status, status_string: data?.status_string, length: data?.length,
     updated_at: data?.change_time, is_multitrack: data?.is_multitrack,
+  };
+}
+
+function productionDetails(data, fallback, env = {}) {
+  return {
+    ...productionSummary(data, fallback),
     start_allowed: data?.start_allowed, change_allowed: data?.change_allowed,
     error: data?.error_message ? { status: data.error_status, message: publicMessage(data.error_message, env) } : undefined,
     warnings: data?.warning_message ? [{ status: data.warning_status, message: publicMessage(data.warning_message, env) }] : [],
@@ -186,12 +192,19 @@ tool("list_service_files", "Liste les fichiers média accessibles sur un service
   return { service: id, files: records(await api(env, "/service/" + id + "/ls.json")).filter((file) => typeof file === "string") };
 });
 
-tool("list_productions", "Liste les productions Auphonic avec pagination et filtre de statut.", {
-  limit: { ...integer("Nombre de résultats (20 par défaut)", 1), maximum: 100 },
-  offset: integer("Décalage de pagination"), status: integer("Code de statut Auphonic"),
-}, [], readOnly, async (args, env) => records(await api(env, "/productions.json", {
-  query: { limit: args.limit ?? 20, offset: args.offset, status: args.status, minimal_data: 1 },
-})).map((item) => productionDetails(item, undefined, env)));
+tool("list_productions", "Liste les résumés d’une page Auphonic. Utilisez next_offset pour avancer, même si le filtre ne laisse aucun résultat. Consultez check_status pour les pistes, la transcription et les autres détails.", {
+  limit: { ...integer("Taille de la page avant filtrage (20 par défaut)", 1), maximum: 100 },
+  offset: integer("Nombre de productions à sauter avant filtrage"), status: integer("Code de statut Auphonic à retenir dans la page"),
+}, [], readOnly, async ({ limit = 20, offset = 0, status }, env) => {
+  const page = records(await api(env, "/productions.json", { query: { limit, offset, minimal_data: 1 } }));
+  return {
+    items: page.filter((item) => status === undefined || item.status === status).map((item) => ({
+      ...productionSummary(item),
+      outputs: Array.isArray(item.output_files) ? outputDetails(item.output_files) : undefined,
+    })),
+    next_offset: page.length === limit ? offset + limit : null,
+  };
+});
 
 tool("check_status", "Consulte le statut et les réglages effectifs d’une production, dont les algorithmes du master et des pistes, les débits de sortie, la transcription et la validation avant publication.", {
   production_uuid: productionId,
@@ -431,7 +444,7 @@ const trackAlgorithmFields = {
 const masterAlgorithmFields = {
   leveler: bool("Activer le nivellement"), loudnesstarget: number("Cible de sonie en LUFS"),
   levelermode: { type: "string", enum: ["standard", "default", "broadcast", "musicspeech"],
-    description: "Mode demandé. standard correspond à default dans Auphonic. Le MCP vérifie le mode effectivement renvoyé." },
+    description: "Sélecteur MCP traduit en réglages de nivellement. standard correspond à default dans la réponse Auphonic. Le mode est vérifié après enregistrement." },
   maxlra: integer("Limite MaxLRA du mode Broadcast en LU. 0 signifie Auto."),
   maxs: integer("Limite MaxS du mode Broadcast en LU. 0 signifie Auto."),
   maxm: integer("Limite MaxM du mode Broadcast en LU. 0 signifie Auto."),
@@ -482,6 +495,8 @@ function algorithmPatch(algorithms) {
 }
 
 const broadcastParameters = ["maxlra", "maxs", "maxm"];
+const musicSpeechParameters = ["levelerstrength_speech", "levelerstrength_music", "compressor_speech", "compressor_music",
+  "levelerstrength_m", "compressor_m", "msclassifier"];
 
 function publicationReviewEnabled(production) {
   return production?.review_before_publishing === true && production.in_review !== false;
@@ -495,6 +510,11 @@ function masterAlgorithmPatch(algorithms, current) {
   const settings = algorithmPatch(algorithms);
   const mode = requestedLevelerMode(algorithms);
   if (!mode) return settings;
+  if (mode === "default" && current.algorithms?.levelermode === "broadcast") {
+    throw new ToolError("LEVELER_MODE_UNSUPPORTED",
+      "Auphonic conserve le mode Broadcast lors des mises à jour par API. Sélectionnez Standard dans l’éditeur Auphonic, puis vérifiez avec check_status.",
+      { production_uuid: current.uuid, next_action: "check_status" });
+  }
   if (mode === "musicspeech" && current.is_multitrack) {
     throw new UploadInputError("Le mode Music/Speech du master est réservé aux productions mono.");
   }
@@ -503,10 +523,21 @@ function masterAlgorithmPatch(algorithms, current) {
   }
   if (mode === "broadcast") {
     for (const key of broadcastParameters) settings[key] ??= current.algorithms?.[key] ?? 0;
+  } else if (mode === "musicspeech") {
+    if (current.algorithms?.levelermode !== mode && !musicSpeechParameters.some((key) => Object.hasOwn(settings, key))) {
+      settings.levelerstrength_speech = settings.levelerstrength ?? current.algorithms?.levelerstrength ?? 100;
+    }
+  } else {
+    if (musicSpeechParameters.some((key) => Object.hasOwn(settings, key))) {
+      throw new UploadInputError("Les paramètres distincts pour la musique et la voix ne sélectionnent pas le nivellement Standard.");
+    }
+    if (!current.is_multitrack && current.algorithms?.levelermode !== mode) {
+      settings.levelerstrength ??= current.algorithms?.levelerstrength ?? 100;
+      settings.compressor ??= current.algorithms?.compressor ?? "auto";
+    }
   }
-  // Auphonic derives Broadcast from the presence of its tuning parameters.
-  // Send the requested mode on the production update and verify it on readback.
-  return { ...settings, leveler: settings.leveler ?? true, levelermode: mode };
+  // Auphonic derives the mode from the supplied parameters.
+  return { ...settings, leveler: settings.leveler ?? true };
 }
 
 function matchesSetting(actual, wanted) {
@@ -583,8 +614,7 @@ function productionChanges(args, current) {
   if (algorithms) {
     const changes = masterAlgorithmPatch(algorithms, current);
     if (!Object.keys(changes).length) throw new UploadInputError("Le champ cutter est calculé par Auphonic. Indiquez les types de coupe à modifier.");
-    if (requestedLevelerMode(algorithms)) post("algorithms", ".json", { algorithms: changes });
-    else post("algorithms", "/algorithms.json", changes);
+    post("algorithms", "/algorithms.json", changes);
   }
 
   const trackIds = new Set();
